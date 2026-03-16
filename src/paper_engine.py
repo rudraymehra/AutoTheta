@@ -1,7 +1,7 @@
 import logging
 import sqlite3
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 from config.settings import DB_PATH, INITIAL_CAPITAL, MAX_LOSS_PER_DAY, SLIPPAGE_PCT

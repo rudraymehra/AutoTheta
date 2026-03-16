@@ -12,18 +12,15 @@ Flow:
 import logging
 import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 
 import pytz
 
 from config.settings import (
-    EXIT_HOUR,
-    EXIT_MINUTE,
     MONITOR_INTERVAL,
     NIFTY_LOT_SIZE,
     NIFTY_STRIKE_GAP,
     OTM_OFFSET,
-    SL_MULTIPLIER,
     WING_WIDTH,
 )
 from src.broker import BaseBroker

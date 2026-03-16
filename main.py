@@ -6,7 +6,6 @@ Entry point. Runs the strategy at 2:00 PM IST on Nifty expiry days (Tuesday).
 import logging
 import logging.handlers
 import sys
-from pathlib import Path
 
 import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler
