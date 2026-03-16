@@ -1,43 +1,39 @@
-"""AutoTheta — Nifty Expiry Day OTM Premium Skew Trading Bot.
+"""AutoTheta — Multi-Strategy Nifty Trading Bot.
 
-Entry point. Runs the strategy at 2:00 PM IST on Nifty expiry days (Tuesday).
+Strategies:
+1. RSI Oversold Bounce on Nifty 50 stocks (intraday, every trading day)
+2. OTM Premium Skew Iron Condor on Nifty expiry (Tuesday)
+
+Both run concurrently via asyncio through a single Angel One SmartAPI session.
 """
 
+import asyncio
 import logging
 import logging.handlers
+import os
+import signal
 import sys
+from pathlib import Path
 
-import pytz
-from apscheduler.schedulers.blocking import BlockingScheduler
-from apscheduler.triggers.cron import CronTrigger
+import yaml
+from dotenv import load_dotenv
 
-from config.settings import (
-    ENTRY_HOUR,
-    ENTRY_MINUTE,
-    INITIAL_CAPITAL,
-    LOGS_DIR,
-    TRADING_MODE,
-)
-from src.auth import AngelSession
-from src.broker import create_broker
-from src.data import MarketData
-from src.expiry import is_nifty_expiry_day
-from src.instruments import InstrumentMaster
-from src.paper_engine import PaperTradingEngine
-from src.risk import RiskManager
-from src.strategy import OTMSkewStrategy
+# Load env vars before anything else
+load_dotenv()
 
-IST = pytz.timezone("Asia/Kolkata")
+LOGS_DIR = Path("logs")
+LOGS_DIR.mkdir(exist_ok=True)
 
 
-def setup_logging() -> logging.Logger:
+def setup_logging(level: str = "INFO") -> logging.Logger:
     """Configure console + rotating file + trade-specific loggers."""
-    LOGS_DIR.mkdir(exist_ok=True)
     logger = logging.getLogger("autotheta")
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-                            datefmt="%Y-%m-%d %H:%M:%S")
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     # Console
     ch = logging.StreamHandler(sys.stdout)
@@ -64,81 +60,42 @@ def setup_logging() -> logging.Logger:
     return logger
 
 
-log = setup_logging()
+def load_config(path: str = "config/config.yaml") -> dict:
+    """Load YAML config with env var interpolation."""
+    with open(path) as f:
+        raw = f.read()
+
+    # Replace ${VAR} with env values
+    for key, value in os.environ.items():
+        raw = raw.replace(f"${{{key}}}", value)
+
+    return yaml.safe_load(raw)
 
 
-def execute_strategy():
-    """Called by the scheduler at 2 PM IST on Mon-Tue."""
-    # 1. Check if today is actually an expiry day
-    if not is_nifty_expiry_day():
-        log.info("Not an expiry day — skipping")
-        return
+async def main():
+    config = load_config()
+    log = setup_logging(config["bot"].get("log_level", "INFO"))
 
     log.info("=" * 60)
-    log.info("EXPIRY DAY — Starting AutoTheta strategy [mode=%s]", TRADING_MODE)
+    log.info("AutoTheta v2.0 — Multi-Strategy Trading Bot")
+    log.info("Mode: %s", "PAPER" if config["bot"].get("paper_mode", True) else "LIVE")
+    enabled = [s["strategy"]["name"] for s in config["strategies"]
+               if s["strategy"].get("enabled", True)]
+    log.info("Strategies: %s", ", ".join(enabled))
     log.info("=" * 60)
 
-    # 2. Authenticate
-    session = AngelSession()
-    if not session.login():
-        log.error("Authentication failed — aborting")
-        return
+    # Import here to avoid circular imports at module level
+    from core.engine import TradingEngine
 
-    try:
-        # 3. Load instruments
-        instruments = InstrumentMaster()
-        if not instruments.load():
-            log.error("Instrument master load failed — aborting")
-            return
+    engine = TradingEngine(config)
 
-        # 4. Initialize components
-        market_data = MarketData(session.api)
-        risk = RiskManager(capital=INITIAL_CAPITAL)
+    # Graceful shutdown on SIGINT/SIGTERM
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, engine.shutdown)
 
-        if TRADING_MODE == "live":
-            broker = create_broker(api=session.api)
-        else:
-            engine = PaperTradingEngine()
-            broker = create_broker(paper_engine=engine)
-
-        # 5. Run strategy
-        strategy = OTMSkewStrategy(market_data, instruments, broker, risk)
-        traded = strategy.run()
-
-        if traded:
-            log.info("Trade executed. Daily P&L: ₹%.2f", risk.daily_pnl)
-        else:
-            log.info("No trade taken today")
-
-    except Exception:
-        log.exception("Unhandled error in strategy execution")
-    finally:
-        session.logout()
-
-
-def main():
-    log.info("=" * 60)
-    log.info("AutoTheta Bot v1.0 — Nifty OTM Premium Skew")
-    log.info("Mode: %s | Capital: ₹%.0f", TRADING_MODE, INITIAL_CAPITAL)
-    log.info("Schedule: %02d:%02d IST on Nifty expiry days (Tue)", ENTRY_HOUR, ENTRY_MINUTE)
-    log.info("=" * 60)
-
-    scheduler = BlockingScheduler(timezone=IST)
-    # Trigger Mon-Tue to catch both regular Tuesday expiry and holiday-shifted Monday
-    scheduler.add_job(
-        execute_strategy,
-        CronTrigger(day_of_week="mon-tue", hour=ENTRY_HOUR, minute=ENTRY_MINUTE, timezone=IST),
-        id="autotheta_main",
-        misfire_grace_time=300,
-    )
-
-    try:
-        log.info("Scheduler started. Waiting for next expiry day...")
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        log.info("Shutting down...")
-        scheduler.shutdown()
+    await engine.start()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

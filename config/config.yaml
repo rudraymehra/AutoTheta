@@ -1,0 +1,76 @@
+# ═══════════════════════════════════════════════
+# AutoTheta — Multi-Strategy Trading Bot Config
+# ═══════════════════════════════════════════════
+
+bot:
+  paper_mode: true
+  db_path: "data/trades.db"
+  log_level: "INFO"
+
+broker:
+  provider: "angelone"
+  # These are loaded from .env — do NOT put secrets here
+  api_key: "${ANGEL_API_KEY}"
+  client_code: "${ANGEL_CLIENT_ID}"
+  mpin: "${ANGEL_PASSWORD}"
+  totp_secret: "${ANGEL_TOTP_SECRET}"
+
+# Global risk limits (across ALL strategies)
+risk:
+  max_daily_loss: 15000         # ₹15K total daily loss cap
+  max_total_exposure: 500000    # ₹5L total position value
+
+# ─── Strategy Definitions ───
+strategies:
+
+  # ━━━ Strategy 1: RSI Oversold Bounce on Nifty 50 Stocks ━━━
+  - strategy:
+      name: "RSI_Bounce_Nifty50"
+      type: "rsi_bounce"
+      enabled: true
+    parameters:
+      rsi_period: 7                    # RSI(7) — faster than default 14
+      oversold_threshold: 20           # Entry when RSI < 20
+      exit_1_rsi: 40                   # First partial exit (50%) at RSI 40
+      exit_2_rsi: 50                   # Final exit at RSI 50
+      atr_sl_multiplier: 1.5           # SL = 1.5 × ATR(14) below entry
+      time_stop_candles: 15            # Exit if RSI hasn't hit 40 in 15 candles
+      skip_first_minutes: 15           # Skip 9:15-9:30 opening noise
+      max_positions: 4                 # Max simultaneous positions
+      max_per_sector: 1                # Max 1 banking stock etc
+      volume_spike_multiplier: 1.5     # Volume must be 1.5x 20-period avg
+      adx_threshold: 20                # ADX must be > 20
+      market_wide_threshold: 10        # If >10 stocks trigger, reduce activity
+    risk:
+      capital_allocation: 250000       # ₹2.5L allocated
+      risk_per_trade_pct: 1.0          # Max 1% risk per trade (₹2,500)
+      daily_loss_cap: 7500             # ₹7,500 daily cap for this strategy
+      max_positions: 4
+      max_consecutive_losses: 3        # Cooldown after 3 losses in a row
+      cooldown_minutes: 30             # 30-min cooldown
+
+  # ━━━ Strategy 2: OTM Premium Skew Iron Condor on Nifty Expiry ━━━
+  - strategy:
+      name: "Expiry_OTM_Skew"
+      type: "expiry_skew"
+      enabled: true
+    parameters:
+      otm_offset: 50                   # 50 points OTM from ATM
+      wing_width: 100                  # 100-point wings for iron condor
+      min_skew_ratio: 2.0              # Min put/call premium ratio
+      sl_multiplier: 2.0               # SL at 2x entry premium
+      entry_hour: 14                   # Enter at 2:00 PM IST
+      entry_minute: 0
+      exit_hour: 15                    # Hard exit at 3:15 PM IST
+      exit_minute: 15
+      monitor_interval: 30             # Check every 30 seconds
+      lot_size: 65                     # Nifty lot size (Jan 2026+)
+      vix_min: 12                      # Only trade when VIX 12-18
+      vix_max: 18
+    risk:
+      capital_allocation: 250000
+      risk_per_trade_pct: 1.0
+      daily_loss_cap: 7500
+      max_positions: 1                 # Only 1 iron condor at a time
+      max_consecutive_losses: 3
+      cooldown_minutes: 0              # No cooldown (weekly strategy)
