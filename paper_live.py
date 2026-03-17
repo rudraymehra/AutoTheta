@@ -453,6 +453,8 @@ def main():
         # Market hours: 9:30 AM - 3:10 PM
         if now.hour < 9 or (now.hour == 9 and now.minute < 30):
             continue
+
+        # After 3:10 PM — close all positions
         if now.hour >= 15 and now.minute > 10:
             for tid in list(portfolio.positions.keys()):
                 pos = portfolio.positions[tid]
@@ -460,6 +462,11 @@ def main():
                 df = candle_builder.get_df(tok) if tok else None
                 if df is not None and len(df) > 0:
                     portfolio.close_position(tid, df["close"].iloc[-1], pos["remaining"], "EOD_EXIT")
+
+            # Auto-stop at 3:30 PM — market is closed
+            if now.hour >= 15 and now.minute >= 30:
+                print(f"\n\n  [3:30 PM] Market closed — auto-stopping bot")
+                running[0] = False
             continue
 
         # ── Scan all stocks ──
