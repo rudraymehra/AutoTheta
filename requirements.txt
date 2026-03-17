@@ -2,7 +2,7 @@ smartapi-python==1.5.5
 pyotp==2.9.0
 python-dotenv==1.0.1
 pandas==2.2.3
-pandas_ta==0.3.14b1
+pandas_ta==0.4.71b0
 requests==2.32.3
 APScheduler==3.10.4
 tenacity==9.0.0

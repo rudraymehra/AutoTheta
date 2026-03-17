@@ -51,7 +51,7 @@ MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL", "30"))
 # ── Constants ──
 NIFTY_LOT_SIZE = 65  # Changed from 75 in Jan 2026
 NIFTY_SPOT_TOKEN = "99926000"
-INDIA_VIX_TOKEN = "99926004"
+INDIA_VIX_TOKEN = "99926017"  # 99926004 is Nifty 500, NOT VIX
 NIFTY_STRIKE_GAP = 50  # Nifty strikes are 50 points apart
 
 # ── Instrument Master URL ──

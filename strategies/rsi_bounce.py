@@ -48,7 +48,7 @@ SECTOR_MAP = {
     "BRITANNIA-EQ": "FMCG", "TATACONSUM-EQ": "FMCG",
     "SUNPHARMA-EQ": "Pharma", "DRREDDY-EQ": "Pharma", "CIPLA-EQ": "Pharma",
     "APOLLOHOSP-EQ": "Pharma",
-    "TATAMOTORS-EQ": "Auto", "M&M-EQ": "Auto", "MARUTI-EQ": "Auto",
+    "M&M-EQ": "Auto", "MARUTI-EQ": "Auto",
     "BAJAJ-AUTO-EQ": "Auto", "HEROMOTOCO-EQ": "Auto", "EICHERMOT-EQ": "Auto",
     "TATASTEEL-EQ": "Metals", "JSWSTEEL-EQ": "Metals", "HINDALCO-EQ": "Metals",
     "COALINDIA-EQ": "Metals",
@@ -221,6 +221,17 @@ class RSIBounceStrategy(BaseStrategy):
                     log.debug("Filter FAIL: %s below 5m EMA20 (%.2f < %.2f)",
                               symbol, candle.close, ema20.iloc[-1])
                     return False
+        elif df_5m is None or len(df_5m) < 20:
+            # Not enough 5-min data yet — fall back to 1-min EMA(100) as proxy
+            # 100 x 1-min ≈ 20 x 5-min
+            df_1m = self._candle_buffers.get(token)
+            if df_1m is not None and len(df_1m) >= 100:
+                ema100 = ta.ema(df_1m["close"], length=100)
+                if ema100 is not None and not ema100.empty:
+                    if candle.close < ema100.iloc[-1]:
+                        log.debug("Filter FAIL: %s below 1m EMA100 proxy (%.2f < %.2f)",
+                                  symbol, candle.close, ema100.iloc[-1])
+                        return False
 
         # Filter 2: Price at or above VWAP
         vwap = self._vwap_state[token]["vwap"]
@@ -330,28 +341,20 @@ class RSIBounceStrategy(BaseStrategy):
             ).tail(200)
 
     def _update_5min(self, token: str, candle: Candle):
-        """Aggregate 1-min candles into 5-min candles."""
+        """Resample 1-min candles into 5-min candles using time-based grouping."""
         df = self._candle_buffers.get(token)
         if df is None or len(df) < 5:
             return
-        # Simple: take last 5 1-min candles and aggregate
-        last5 = df.tail(5)
-        if len(last5) == 5 and len(df) % 5 == 0:
-            bar = {
-                "timestamp": last5["timestamp"].iloc[0],
-                "open": last5["open"].iloc[0],
-                "high": last5["high"].max(),
-                "low": last5["low"].min(),
-                "close": last5["close"].iloc[-1],
-                "volume": last5["volume"].sum(),
-            }
-            if token not in self._5min_buffers:
-                self._5min_buffers[token] = pd.DataFrame([bar])
-            else:
-                self._5min_buffers[token] = pd.concat(
-                    [self._5min_buffers[token], pd.DataFrame([bar])],
-                    ignore_index=True,
-                ).tail(50)
+        try:
+            temp = df.set_index("timestamp")
+            resampled = temp.resample("5min").agg({
+                "open": "first", "high": "max", "low": "min",
+                "close": "last", "volume": "sum",
+            }).dropna()
+            if not resampled.empty:
+                self._5min_buffers[token] = resampled.reset_index().tail(50)
+        except Exception:
+            pass  # Non-critical — 1-min EMA100 fallback will be used
 
     def _update_vwap(self, token: str, candle: Candle):
         """Incremental VWAP calculation."""

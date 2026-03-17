@@ -26,7 +26,7 @@ trade_log = logging.getLogger("autotheta.trades")
 IST = pytz.timezone("Asia/Kolkata")
 
 NIFTY_SPOT_TOKEN = "99926000"
-INDIA_VIX_TOKEN = "99926004"
+INDIA_VIX_TOKEN = "99926017"  # Correct VIX token (99926004 is Nifty 500)
 
 
 @dataclass
