@@ -1,9 +1,14 @@
 """Paper trading with LIVE WebSocket data.
 
-Uses SmartWebSocketV2 for real-time ticks → builds 1-min candles → runs both strategies.
+Uses SmartWebSocketV2 for real-time ticks → builds 1-min candles → runs RSI bounce strategy.
 No historical API needed = no rate limit issues.
+
+Generates two log files daily in logs/YYYY-MM-DD/:
+  1. thoughts.csv — Every signal the bot considered + why it acted or didn't
+  2. trades.csv   — Only actual paper trades (entries and exits)
 """
 
+import csv
 import json
 import os
 import signal
@@ -12,6 +17,7 @@ import threading
 import time
 from collections import defaultdict
 from datetime import datetime, date, timedelta
+from pathlib import Path
 
 import pandas as pd
 import pyotp
@@ -19,7 +25,8 @@ from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 from dotenv import load_dotenv
 
-load_dotenv("/Users/rudraym/Trader/.env")
+PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(PROJECT_ROOT / ".env")
 
 API_KEY = os.getenv("ANGEL_API_KEY")
 CLIENT_ID = os.getenv("ANGEL_CLIENT_ID")
@@ -88,13 +95,112 @@ CAPITAL = 250000
 
 
 # ══════════════════════════════════════════
+# DAILY LOGGER — two CSV files
+# ══════════════════════════════════════════
+class DailyLogger:
+    """Writes two CSV logs per day:
+    - thoughts.csv: Every signal considered (what the bot saw and why it acted/didn't)
+    - trades.csv:   Only actual entries and exits
+    """
+
+    def __init__(self):
+        self._today = None
+        self._thoughts_writer = None
+        self._trades_writer = None
+        self._thoughts_file = None
+        self._trades_file = None
+        self._ensure_files()
+
+    def _ensure_files(self):
+        today = date.today().isoformat()
+        if today == self._today:
+            return
+
+        # Close previous files
+        if self._thoughts_file:
+            self._thoughts_file.close()
+        if self._trades_file:
+            self._trades_file.close()
+
+        self._today = today
+        log_dir = PROJECT_ROOT / "logs" / today
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Thoughts log — what the bot considered
+        thoughts_path = log_dir / "thoughts.csv"
+        is_new = not thoughts_path.exists()
+        self._thoughts_file = open(thoughts_path, "a", newline="")
+        self._thoughts_writer = csv.writer(self._thoughts_file)
+        if is_new:
+            self._thoughts_writer.writerow([
+                "Time", "Stock", "Price", "RSI(7)", "Signal",
+                "EMA20_5m", "vs_EMA", "VWAP", "vs_VWAP",
+                "Volume", "Vol_Avg", "vs_Vol",
+                "Decision", "Reason",
+            ])
+
+        # Trades log — what the bot actually did
+        trades_path = log_dir / "trades.csv"
+        is_new = not trades_path.exists()
+        self._trades_file = open(trades_path, "a", newline="")
+        self._trades_writer = csv.writer(self._trades_file)
+        if is_new:
+            self._trades_writer.writerow([
+                "Time", "Action", "Stock", "Qty", "Price",
+                "RSI", "Stop_Loss", "Reason", "P&L",
+            ])
+
+    def log_thought(self, stock, price, rsi_val, signal_type,
+                    ema20_5m, vwap_val, volume, vol_avg,
+                    decision, reason):
+        """Log what the bot saw and why it decided what it did."""
+        self._ensure_files()
+        now = datetime.now().strftime("%H:%M:%S")
+
+        vs_ema = ""
+        if ema20_5m and ema20_5m > 0:
+            vs_ema = "ABOVE" if price >= ema20_5m else "BELOW"
+        vs_vwap = "ABOVE" if vwap_val and price >= vwap_val * 0.998 else "BELOW"
+        vs_vol = ""
+        if vol_avg and vol_avg > 0:
+            vs_vol = "HIGH" if volume >= vol_avg * 1.5 else "LOW"
+
+        self._thoughts_writer.writerow([
+            now, stock, f"{price:.2f}", f"{rsi_val:.1f}", signal_type,
+            f"{ema20_5m:.2f}" if ema20_5m else "N/A", vs_ema,
+            f"{vwap_val:.2f}" if vwap_val else "N/A", vs_vwap,
+            f"{volume:.0f}", f"{vol_avg:.0f}" if vol_avg else "N/A", vs_vol,
+            decision, reason,
+        ])
+        self._thoughts_file.flush()
+
+    def log_trade(self, action, stock, qty, price, rsi_val=0,
+                  stop_loss=0, reason="", pnl=0):
+        """Log an actual trade action."""
+        self._ensure_files()
+        now = datetime.now().strftime("%H:%M:%S")
+        self._trades_writer.writerow([
+            now, action, stock, qty, f"{price:.2f}",
+            f"{rsi_val:.1f}" if rsi_val else "",
+            f"{stop_loss:.2f}" if stop_loss else "",
+            reason,
+            f"{pnl:+.2f}" if pnl else "",
+        ])
+        self._trades_file.flush()
+
+    def close(self):
+        if self._thoughts_file:
+            self._thoughts_file.close()
+        if self._trades_file:
+            self._trades_file.close()
+
+
+# ══════════════════════════════════════════
 # CANDLE BUILDER — ticks → 1-min OHLCV
 # ══════════════════════════════════════════
 class CandleBuilder:
     def __init__(self):
-        # token -> {minute_key -> {o, h, l, c, v}}
         self._building = defaultdict(dict)
-        # token -> list of completed candle dicts
         self._candles = defaultdict(list)
         self._lock = threading.Lock()
 
@@ -104,18 +210,14 @@ class CandleBuilder:
 
         with self._lock:
             buckets = self._building[token]
-
-            # Finalize old candles
             for mk in list(buckets.keys()):
                 if mk != minute_key:
                     candle = buckets.pop(mk)
                     candle["timestamp"] = pd.Timestamp(mk)
                     self._candles[token].append(candle)
-                    # Trim to 200
                     if len(self._candles[token]) > 200:
                         self._candles[token] = self._candles[token][-200:]
 
-            # Update current candle
             if minute_key not in buckets:
                 buckets[minute_key] = {
                     "open": ltp, "high": ltp, "low": ltp, "close": ltp, "volume": volume,
@@ -143,12 +245,13 @@ class CandleBuilder:
 # PAPER PORTFOLIO
 # ══════════════════════════════════════════
 class PaperPortfolio:
-    def __init__(self, capital):
+    def __init__(self, capital, logger: DailyLogger):
         self.capital = capital
-        self.positions = {}  # trade_id -> dict
+        self.positions = {}
         self.closed_trades = []
         self.daily_pnl = 0.0
         self.sector_count = defaultdict(int)
+        self.log = logger
 
     def open_position(self, trade_id, symbol, price, quantity, stop_loss, rsi_val):
         sector = SECTOR_MAP.get(symbol, "Other")
@@ -159,6 +262,7 @@ class PaperPortfolio:
             "entry_rsi": rsi_val,
         }
         self.sector_count[sector] += 1
+        self.log.log_trade("BUY", symbol, quantity, price, rsi_val, stop_loss, "RSI_OVERSOLD")
         print(f"\n  >> PAPER BUY {symbol} x{quantity} @ Rs{price:.2f} | "
               f"SL=Rs{stop_loss:.2f} | RSI={rsi_val:.1f}")
 
@@ -171,8 +275,10 @@ class PaperPortfolio:
         pos["remaining"] -= quantity
         self.daily_pnl += pnl
 
+        self.log.log_trade("SELL", pos["symbol"], quantity, price, reason=reason, pnl=pnl)
+
         emoji = "+" if pnl >= 0 else ""
-        print(f"  << PAPER SELL {pos['symbol']} x{quantity} @ Rs{price:.2f} | "
+        print(f"\n  << PAPER SELL {pos['symbol']} x{quantity} @ Rs{price:.2f} | "
               f"reason={reason} | P&L=Rs{emoji}{pnl:.2f}")
 
         if pos["remaining"] <= 0:
@@ -195,6 +301,10 @@ class PaperPortfolio:
             wins = [t for t in self.closed_trades if t["total_pnl"] > 0]
             losses = [t for t in self.closed_trades if t["total_pnl"] <= 0]
             print(f"  Wins/Losses:     {len(wins)}/{len(losses)}")
+            if wins:
+                print(f"  Avg Win:         Rs{sum(t['total_pnl'] for t in wins)/len(wins):+,.2f}")
+            if losses:
+                print(f"  Avg Loss:        Rs{sum(t['total_pnl'] for t in losses)/len(losses):+,.2f}")
             print(f"\n  Trade Log:")
             for t in self.closed_trades:
                 e = "W" if t["total_pnl"] > 0 else "L"
@@ -203,12 +313,17 @@ class PaperPortfolio:
         for tid, pos in self.positions.items():
             print(f"    [OPEN] {pos['symbol']:15s} Rs{pos['entry_price']:.2f} "
                   f"x{pos['remaining']} | candles={pos['candles_held']}")
+        print(f"\n  Logs saved to: logs/{date.today().isoformat()}/")
+        print(f"    - thoughts.csv  (what the bot considered)")
+        print(f"    - trades.csv    (actual paper trades)")
 
 
 # ══════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════
 def main():
+    logger = DailyLogger()
+
     print("=" * 70)
     print(f"  AutoTheta PAPER TRADING — WebSocket Mode")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST")
@@ -227,12 +342,24 @@ def main():
     print("[OK] Authenticated")
 
     # Load token map
-    with open("/Users/rudraym/Trader/data/instruments.json") as f:
-        master_data = json.load(f)
+    instruments_path = PROJECT_ROOT / "data" / "instruments.json"
+    if not instruments_path.exists():
+        print("[..] Downloading instrument master...")
+        import requests
+        url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+        resp = requests.get(url, timeout=120)
+        instruments_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(instruments_path, "w") as f:
+            f.write(resp.text)
+        master_data = resp.json()
+    else:
+        with open(instruments_path) as f:
+            master_data = json.load(f)
+
     master_df = pd.DataFrame(master_data)
 
-    token_map = {}  # symbol -> token
-    token_to_sym = {}  # token -> symbol
+    token_map = {}
+    token_to_sym = {}
     for sym in STOCKS:
         matches = master_df[(master_df["symbol"] == sym) & (master_df["exch_seg"] == "NSE")]
         if not matches.empty:
@@ -244,46 +371,40 @@ def main():
 
     # Initialize
     candle_builder = CandleBuilder()
-    portfolio = PaperPortfolio(CAPITAL)
+    portfolio = PaperPortfolio(CAPITAL, logger)
     trade_counter = [0]
     running = [True]
 
-    # ── WebSocket callbacks ──
+    # WebSocket callbacks
     def on_data(wsapp, msg):
         try:
             token = str(msg.get("token", ""))
             ltp = msg.get("last_traded_price", 0)
             if isinstance(ltp, (int, float)):
-                ltp = ltp / 100  # Paise -> Rupees
+                ltp = ltp / 100
             volume = msg.get("volume_trade_for_the_day", 0)
             if token and ltp > 0:
                 candle_builder.on_tick(token, ltp, volume)
-        except Exception as e:
+        except Exception:
             pass
 
     def on_open(wsapp):
         tokens = list(token_map.values())
         token_list = [{"exchangeType": 1, "tokens": tokens}]
-        sws.subscribe("autotheta_paper", 2, token_list)  # Mode 2 = Quote
-        print(f"[OK] WebSocket connected — subscribed to {len(tokens)} tokens")
-        print(f"[OK] Building candles from live ticks...")
-        print(f"     (Need ~10 candles before RSI can be calculated)")
+        sws.subscribe("autotheta_paper", 2, token_list)
+        print(f"[OK] WebSocket connected — {len(tokens)} stocks streaming")
+        print(f"[OK] Scanning starts after ~10 candles (~10 min)")
+        print(f"     Logs: logs/{date.today().isoformat()}/thoughts.csv & trades.csv")
         print(f"\n  Ctrl+C to stop and see summary\n")
 
     def on_error(wsapp, error):
-        print(f"  [WS ERROR] {error}")
+        print(f"\n  [WS ERROR] {error}")
 
     def on_close(wsapp):
-        print("  [WS] Connection closed")
+        print("\n  [WS] Connection closed")
 
-    # ── Pure WebSocket mode — no historical API dependency ──
-    # RSI(7) needs ~10 candles to produce meaningful values.
-    # The bot will start scanning after enough candles are built from live ticks.
-    # For instant readiness, start before 9:25 AM — by 9:35 you'll have 10+ candles.
-    print("[OK] Pure WebSocket mode — no historical API needed")
-    print("     RSI scanning starts after ~10 candles are built from live ticks\n")
+    print("[OK] Pure WebSocket mode — no API rate limits")
 
-    # Start WebSocket
     sws = SmartWebSocketV2(auth_token, API_KEY, CLIENT_ID, feed_token)
     sws.on_data = on_data
     sws.on_open = on_open
@@ -299,16 +420,17 @@ def main():
         print("\n\n  Shutting down...")
 
     signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
 
-    # ── Strategy loop — runs every 60s ──
-    last_scan = time.time() - 55  # First scan after 5s warmup
+    # ── Strategy loop ──
+    last_scan = time.time() - 55
     tick_count = 0
 
     while running[0]:
         time.sleep(1)
         tick_count += 1
 
-        # Print status every 10s
+        # Status bar every 10s
         if tick_count % 10 == 0:
             candle_counts = {token_to_sym.get(t, t): candle_builder.candle_count(t)
                             for t in token_map.values()}
@@ -316,22 +438,22 @@ def main():
             active = sum(1 for c in candle_counts.values() if c > 0)
             now = datetime.now()
             print(f"\r  [{now.strftime('%H:%M:%S')}] "
-                  f"Candles: {max_candles} | Active feeds: {active}/{len(token_map)} | "
+                  f"Candles: {max_candles} | Feeds: {active}/{len(token_map)} | "
                   f"Positions: {len(portfolio.positions)} | "
                   f"P&L: Rs{portfolio.daily_pnl:+,.2f}",
                   end="", flush=True)
 
-        # Run strategy scan every 60 seconds
+        # Strategy scan every 60s
         if time.time() - last_scan < 60:
             continue
         last_scan = time.time()
 
         now = datetime.now()
-        # Skip before 9:30 and after 3:10
+
+        # Market hours: 9:30 AM - 3:10 PM
         if now.hour < 9 or (now.hour == 9 and now.minute < 30):
             continue
         if now.hour >= 15 and now.minute > 10:
-            # Close all open positions at EOD
             for tid in list(portfolio.positions.keys()):
                 pos = portfolio.positions[tid]
                 tok = token_map.get(pos["symbol"])
@@ -340,7 +462,7 @@ def main():
                     portfolio.close_position(tid, df["close"].iloc[-1], pos["remaining"], "EOD_EXIT")
             continue
 
-        # ── RSI Bounce scan ──
+        # ── Scan all stocks ──
         for sym, tok in token_map.items():
             df = candle_builder.get_df(tok)
             if df is None or len(df) < 20:
@@ -353,77 +475,119 @@ def main():
             current_rsi = df["rsi"].iloc[-1]
             prev_rsi = df["rsi"].iloc[-2]
             curr_price = df["close"].iloc[-1]
+            curr_vwap = df["vwap_val"].iloc[-1]
+            curr_volume = df["volume"].iloc[-1]
+            vol_avg = df["volume"].iloc[-20:].mean()
 
-            # ── Check exits ──
+            # 5-min EMA20
+            ema20_5m = None
+            df_5m = df.set_index("timestamp").resample("5min").agg({
+                "open": "first", "high": "max", "low": "min",
+                "close": "last", "volume": "sum",
+            }).dropna().reset_index()
+            if len(df_5m) >= 20:
+                ema20_5m = ema(df_5m["close"], 20).iloc[-1]
+
+            # ── Check exits for open positions ──
             for tid in list(portfolio.positions.keys()):
                 pos = portfolio.positions.get(tid)
                 if not pos or pos["symbol"] != sym:
                     continue
                 pos["candles_held"] += 1
 
-                # Stop-loss
                 if curr_price <= pos["stop_loss"]:
                     portfolio.close_position(tid, curr_price, pos["remaining"], "STOP_LOSS")
                     continue
-
-                # Time stop
                 if pos["candles_held"] >= TIME_STOP and current_rsi < EXIT_1_RSI:
                     portfolio.close_position(tid, curr_price, pos["remaining"], "TIME_STOP")
                     continue
-
-                # Partial exit at RSI 40
                 if pos["status"] == "open" and current_rsi >= EXIT_1_RSI:
                     exit_qty = pos["remaining"] // 2
                     if exit_qty > 0:
                         portfolio.close_position(tid, curr_price, exit_qty, "RSI_40")
                         pos["status"] = "partial"
-
-                # Final exit at RSI 50
                 elif pos["status"] == "partial" and current_rsi >= EXIT_2_RSI:
                     portfolio.close_position(tid, curr_price, pos["remaining"], "RSI_50")
 
             # ── Check entry ──
-            if not (prev_rsi >= OVERSOLD and current_rsi < OVERSOLD):
+            # Only log thoughts when RSI is interesting (< 30)
+            if current_rsi >= 30:
                 continue
 
+            # RSI crossover below 20?
+            is_trigger = prev_rsi >= OVERSOLD and current_rsi < OVERSOLD
+
+            if not is_trigger:
+                # RSI is low but no crossover yet — log as WATCHING
+                if current_rsi < OVERSOLD:
+                    logger.log_thought(
+                        sym, curr_price, current_rsi, "OVERSOLD",
+                        ema20_5m, curr_vwap, curr_volume, vol_avg,
+                        "WATCHING", "RSI below 20 but no crossover yet",
+                    )
+                continue
+
+            # ── RSI crossed below 20 — run filter stack ──
             # Already holding?
             if any(p["symbol"] == sym for p in portfolio.positions.values()):
+                logger.log_thought(
+                    sym, curr_price, current_rsi, "RSI<20",
+                    ema20_5m, curr_vwap, curr_volume, vol_avg,
+                    "SKIP", "Already holding this stock",
+                )
                 continue
+
             if len(portfolio.positions) >= MAX_POSITIONS:
+                logger.log_thought(
+                    sym, curr_price, current_rsi, "RSI<20",
+                    ema20_5m, curr_vwap, curr_volume, vol_avg,
+                    "SKIP", f"Max positions ({MAX_POSITIONS}) reached",
+                )
                 continue
 
             sector = SECTOR_MAP.get(sym, "Other")
             if portfolio.sector_count.get(sector, 0) >= MAX_PER_SECTOR:
+                logger.log_thought(
+                    sym, curr_price, current_rsi, "RSI<20",
+                    ema20_5m, curr_vwap, curr_volume, vol_avg,
+                    "SKIP", f"Sector limit: {sector} already has a position",
+                )
                 continue
 
-            # 5-min EMA20 filter
-            df_5m = df.set_index("timestamp").resample("5min").agg({
-                "open": "first", "high": "max", "low": "min",
-                "close": "last", "volume": "sum",
-            }).dropna().reset_index()
-
-            if len(df_5m) >= 20:
-                ema20_5m = ema(df_5m["close"], 20).iloc[-1]
-                if curr_price < ema20_5m:
-                    print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI={current_rsi:.1f} "
-                          f"— FILTERED (below 5m EMA20: {ema20_5m:.2f})")
-                    continue
-
-            # VWAP filter
-            curr_vwap = df["vwap_val"].iloc[-1]
-            if curr_price < curr_vwap * 0.998:
+            # Filter 1: 5-min EMA20
+            if ema20_5m and curr_price < ema20_5m:
+                logger.log_thought(
+                    sym, curr_price, current_rsi, "RSI<20",
+                    ema20_5m, curr_vwap, curr_volume, vol_avg,
+                    "FILTERED", f"Price below 5m EMA20 ({ema20_5m:.2f})",
+                )
                 print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI={current_rsi:.1f} "
-                      f"— FILTERED (below VWAP: {curr_vwap:.2f})")
+                      f"— FILTERED (below 5m EMA20)")
                 continue
 
-            # Volume filter
-            vol_avg = df["volume"].iloc[-20:].mean()
-            if vol_avg > 0 and df["volume"].iloc[-1] < vol_avg * 1.5:
+            # Filter 2: VWAP
+            if curr_price < curr_vwap * 0.998:
+                logger.log_thought(
+                    sym, curr_price, current_rsi, "RSI<20",
+                    ema20_5m, curr_vwap, curr_volume, vol_avg,
+                    "FILTERED", f"Price below VWAP ({curr_vwap:.2f})",
+                )
+                print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI={current_rsi:.1f} "
+                      f"— FILTERED (below VWAP)")
+                continue
+
+            # Filter 3: Volume
+            if vol_avg > 0 and curr_volume < vol_avg * 1.5:
+                logger.log_thought(
+                    sym, curr_price, current_rsi, "RSI<20",
+                    ema20_5m, curr_vwap, curr_volume, vol_avg,
+                    "FILTERED", f"Volume {curr_volume:.0f} < 1.5x avg ({vol_avg*1.5:.0f})",
+                )
                 print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI={current_rsi:.1f} "
                       f"— FILTERED (low volume)")
                 continue
 
-            # Position sizing
+            # All filters passed — calculate position
             curr_atr = df["atr"].iloc[-1]
             if pd.isna(curr_atr) or curr_atr <= 0:
                 curr_atr = curr_price * 0.005
@@ -436,7 +600,13 @@ def main():
             if qty <= 0:
                 continue
 
-            # ENTRY
+            # ── ENTRY ──
+            logger.log_thought(
+                sym, curr_price, current_rsi, "RSI<20",
+                ema20_5m, curr_vwap, curr_volume, vol_avg,
+                "BUY", f"All filters passed | Qty={qty} SL={stop_loss:.2f} ATR={curr_atr:.2f}",
+            )
+
             trade_counter[0] += 1
             tid = f"PAPER-{trade_counter[0]:04d}"
             portfolio.open_position(tid, sym, curr_price, qty, stop_loss, current_rsi)
@@ -444,10 +614,11 @@ def main():
     # ── Shutdown ──
     try:
         sws.close_connection()
-    except:
+    except Exception:
         pass
 
     portfolio.summary()
+    logger.close()
 
 
 if __name__ == "__main__":
