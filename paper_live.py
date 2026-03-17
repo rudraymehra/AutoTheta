@@ -276,35 +276,12 @@ def main():
     def on_close(wsapp):
         print("  [WS] Connection closed")
 
-    # ── Seed candle builder with historical data (avoids 10-min warmup) ──
-    print("[..] Seeding candle history via REST (1 req per 1.5s)...")
-    now = datetime.now()
-    from_dt = now.replace(hour=9, minute=15, second=0).strftime("%Y-%m-%d %H:%M")
-    to_dt = now.strftime("%Y-%m-%d %H:%M")
-    seeded = 0
-    for sym, tok in token_map.items():
-        time.sleep(1.5)
-        try:
-            result = api.getCandleData({
-                "exchange": "NSE", "symboltoken": tok,
-                "interval": "ONE_MINUTE",
-                "fromdate": from_dt, "todate": to_dt,
-            })
-            if result and result.get("data"):
-                for row in result["data"]:
-                    ts = pd.Timestamp(row[0])
-                    mk = ts.strftime("%Y-%m-%d %H:%M")
-                    candle_builder._candles[tok].append({
-                        "timestamp": ts, "open": float(row[1]), "high": float(row[2]),
-                        "low": float(row[3]), "close": float(row[4]), "volume": int(row[5]),
-                    })
-                seeded += 1
-                print(f"  {sym:18s} — {len(result['data'])} candles seeded")
-            else:
-                print(f"  {sym:18s} — No data (rate limited?)")
-        except Exception as e:
-            print(f"  {sym:18s} — Error: {e}")
-    print(f"[OK] Seeded {seeded} stocks with historical candles\n")
+    # ── Pure WebSocket mode — no historical API dependency ──
+    # RSI(7) needs ~10 candles to produce meaningful values.
+    # The bot will start scanning after enough candles are built from live ticks.
+    # For instant readiness, start before 9:25 AM — by 9:35 you'll have 10+ candles.
+    print("[OK] Pure WebSocket mode — no historical API needed")
+    print("     RSI scanning starts after ~10 candles are built from live ticks\n")
 
     # Start WebSocket
     sws = SmartWebSocketV2(auth_token, API_KEY, CLIENT_ID, feed_token)
