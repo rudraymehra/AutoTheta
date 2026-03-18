@@ -1,11 +1,15 @@
 #!/bin/bash
-# AutoTheta — daily startup script (called by cron at 9:10 AM IST)
+# AutoTheta — daily startup script (called by launchd at 9:10 AM IST)
 
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 cd /Users/rudraym/Trader
-source .venv/bin/activate
+
+VENV_PYTHON="/Users/rudraym/Trader/.venv/bin/python3"
+TODAY=$(date +%Y-%m-%d)
+mkdir -p "logs/$TODAY"
 
 # Download fresh instrument master (updates daily at 8:30 AM)
-python3 -c "
+$VENV_PYTHON -c "
 import requests, json
 from pathlib import Path
 print('Downloading instrument master...')
@@ -14,10 +18,7 @@ Path('data').mkdir(exist_ok=True)
 with open('data/instruments.json', 'w') as f:
     json.dump(r.json(), f)
 print(f'Done: {len(r.json())} instruments')
-" 2>&1
+" >> "logs/$TODAY/console.log" 2>&1
 
-# Run paper trading bot (runs until market close or Ctrl+C)
-# Output goes to today's log file
-TODAY=$(date +%Y-%m-%d)
-mkdir -p "logs/$TODAY"
-python3 paper_live.py >> "logs/$TODAY/console.log" 2>&1
+# Run paper trading bot (runs until 3:30 PM auto-stop)
+exec $VENV_PYTHON paper_live.py >> "logs/$TODAY/console.log" 2>&1

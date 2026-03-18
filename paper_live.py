@@ -291,31 +291,47 @@ class PaperPortfolio:
             del self.positions[trade_id]
 
     def summary(self):
+        pnl_pct = (self.daily_pnl / self.capital) * 100
+
         print(f"\n  {'='*60}")
-        print(f"  PAPER TRADING SUMMARY")
+        print(f"  PAPER TRADING SUMMARY — {date.today().isoformat()}")
         print(f"  {'='*60}")
-        print(f"  Open positions:  {len(self.positions)}")
-        print(f"  Closed trades:   {len(self.closed_trades)}")
-        print(f"  Daily P&L:       Rs{self.daily_pnl:+,.2f}")
+        print(f"  Starting Capital:  Rs{self.capital:,.2f}")
+        print(f"  Daily P&L:         Rs{self.daily_pnl:+,.2f} ({pnl_pct:+.2f}%)")
+        print(f"  Closing Capital:   Rs{self.capital + self.daily_pnl:,.2f}")
+        print(f"  {'─'*60}")
+        print(f"  Closed trades:     {len(self.closed_trades)}")
         if self.closed_trades:
             wins = [t for t in self.closed_trades if t["total_pnl"] > 0]
             losses = [t for t in self.closed_trades if t["total_pnl"] <= 0]
-            print(f"  Wins/Losses:     {len(wins)}/{len(losses)}")
+            win_rate = len(wins) / len(self.closed_trades) * 100
+            print(f"  Wins/Losses:       {len(wins)}/{len(losses)} ({win_rate:.0f}% win rate)")
             if wins:
-                print(f"  Avg Win:         Rs{sum(t['total_pnl'] for t in wins)/len(wins):+,.2f}")
+                print(f"  Avg Win:           Rs{sum(t['total_pnl'] for t in wins)/len(wins):+,.2f}")
             if losses:
-                print(f"  Avg Loss:        Rs{sum(t['total_pnl'] for t in losses)/len(losses):+,.2f}")
-            print(f"\n  Trade Log:")
+                print(f"  Avg Loss:          Rs{sum(t['total_pnl'] for t in losses)/len(losses):+,.2f}")
+            # Per-trade breakdown
+            print(f"\n  {'─'*60}")
+            print(f"  {'':2s}{'Stock':15s} {'Entry':>10s} {'Exit':>10s} {'Qty':>6s} {'Reason':>12s} {'P&L':>12s} {'%':>8s}")
+            print(f"  {'─'*60}")
             for t in self.closed_trades:
-                e = "W" if t["total_pnl"] > 0 else "L"
-                print(f"    [{e}] {t['symbol']:15s} Rs{t['entry_price']:.2f} -> Rs{t['exit_price']:.2f} "
-                      f"| {t['exit_reason']:12s} | P&L: Rs{t['total_pnl']:+,.2f}")
-        for tid, pos in self.positions.items():
-            print(f"    [OPEN] {pos['symbol']:15s} Rs{pos['entry_price']:.2f} "
-                  f"x{pos['remaining']} | candles={pos['candles_held']}")
-        print(f"\n  Logs saved to: logs/{date.today().isoformat()}/")
-        print(f"    - thoughts.csv  (what the bot considered)")
-        print(f"    - trades.csv    (actual paper trades)")
+                t_pnl_pct = t["total_pnl"] / (t["entry_price"] * t["quantity"]) * 100
+                marker = "W" if t["total_pnl"] > 0 else "L"
+                print(f"  [{marker}] {t['symbol']:15s} {t['entry_price']:>10.2f} {t['exit_price']:>10.2f} "
+                      f"{t['quantity']:>5d}  {t['exit_reason']:>12s} {t['total_pnl']:>+11,.2f} {t_pnl_pct:>+7.2f}%")
+        else:
+            print(f"  (no trades today)")
+
+        if self.positions:
+            print(f"\n  Open positions:")
+            for tid, pos in self.positions.items():
+                print(f"    [OPEN] {pos['symbol']:15s} Rs{pos['entry_price']:.2f} "
+                      f"x{pos['remaining']} | candles={pos['candles_held']}")
+
+        print(f"\n  Logs: logs/{date.today().isoformat()}/")
+        print(f"    thoughts.csv  — what the bot considered")
+        print(f"    trades.csv    — actual paper trades")
+        print(f"  {'='*60}")
 
 
 # ══════════════════════════════════════════
@@ -437,10 +453,11 @@ def main():
             max_candles = max(candle_counts.values()) if candle_counts else 0
             active = sum(1 for c in candle_counts.values() if c > 0)
             now = datetime.now()
+            pnl_pct = (portfolio.daily_pnl / portfolio.capital) * 100
             print(f"\r  [{now.strftime('%H:%M:%S')}] "
                   f"Candles: {max_candles} | Feeds: {active}/{len(token_map)} | "
                   f"Positions: {len(portfolio.positions)} | "
-                  f"P&L: Rs{portfolio.daily_pnl:+,.2f}",
+                  f"P&L: Rs{portfolio.daily_pnl:+,.2f} ({pnl_pct:+.2f}%)",
                   end="", flush=True)
 
         # Strategy scan every 60s
