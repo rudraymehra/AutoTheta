@@ -407,28 +407,54 @@ def main():
     def on_open(wsapp):
         tokens = list(token_map.values())
         token_list = [{"exchangeType": 1, "tokens": tokens}]
-        sws.subscribe("autotheta_paper", 2, token_list)
-        print(f"[OK] WebSocket connected — {len(tokens)} stocks streaming")
+        # Use ws_state["sws"] instead of closed-over variable
+        ws_state["sws"].subscribe("autotheta_paper", 2, token_list)
+        print(f"\n[OK] WebSocket connected — {len(tokens)} stocks streaming")
         print(f"[OK] Scanning starts after ~10 candles (~10 min)")
-        print(f"     Logs: logs/{date.today().isoformat()}/thoughts.csv & trades.csv")
-        print(f"\n  Ctrl+C to stop and see summary\n")
+        print(f"     Logs: logs/{date.today().isoformat()}/thoughts.csv & trades.csv\n")
 
     def on_error(wsapp, error):
         print(f"\n  [WS ERROR] {error}")
 
     def on_close(wsapp):
-        print("\n  [WS] Connection closed")
+        print("\n  [WS] Connection closed — will auto-reconnect")
 
     print("[OK] Pure WebSocket mode — no API rate limits")
 
-    sws = SmartWebSocketV2(auth_token, API_KEY, CLIENT_ID, feed_token)
-    sws.on_data = on_data
-    sws.on_open = on_open
-    sws.on_error = on_error
-    sws.on_close = on_close
+    # ── WebSocket with auto-reconnect ──
+    ws_state = {"sws": None, "last_candle_time": time.time(), "reconnecting": False}
 
-    ws_thread = threading.Thread(target=sws.connect, daemon=True)
-    ws_thread.start()
+    def start_websocket():
+        """Create and start a new WebSocket connection."""
+        # Re-auth to get fresh tokens (old ones may have expired)
+        try:
+            totp_now = pyotp.TOTP(TOTP_SECRET).now()
+            sess = api.generateSession(CLIENT_ID, PASSWORD, totp_now)
+            if sess.get("status"):
+                fresh_auth = sess["data"]["jwtToken"]
+                fresh_feed = api.getfeedToken()
+            else:
+                fresh_auth = auth_token
+                fresh_feed = feed_token
+        except Exception:
+            fresh_auth = auth_token
+            fresh_feed = feed_token
+
+        sws = SmartWebSocketV2(
+            fresh_auth, API_KEY, CLIENT_ID, fresh_feed,
+            max_retry_attempt=50, retry_strategy=0, retry_delay=5,
+        )
+        sws.on_data = on_data
+        sws.on_open = on_open
+        sws.on_error = on_error
+        sws.on_close = on_close
+        ws_state["sws"] = sws
+
+        t = threading.Thread(target=sws.connect, daemon=True)
+        t.start()
+        return t
+
+    ws_thread = start_websocket()
 
     # Graceful shutdown
     def shutdown(sig, frame):
@@ -441,6 +467,7 @@ def main():
     # ── Strategy loop ──
     last_scan = time.time() - 55
     tick_count = 0
+    last_candle_count = 0
 
     while running[0]:
         time.sleep(1)
@@ -459,6 +486,24 @@ def main():
                   f"Positions: {len(portfolio.positions)} | "
                   f"P&L: Rs{portfolio.daily_pnl:+,.2f} ({pnl_pct:+.2f}%)",
                   end="", flush=True)
+
+            # Auto-reconnect: if candles haven't grown in 3 minutes, WS is dead
+            if max_candles > 0 and max_candles == last_candle_count:
+                if time.time() - ws_state["last_candle_time"] > 180:
+                    if not ws_state["reconnecting"]:
+                        ws_state["reconnecting"] = True
+                        print(f"\n  [RECONNECT] No new candles in 3 min — reconnecting WebSocket...")
+                        try:
+                            ws_state["sws"].close_connection()
+                        except Exception:
+                            pass
+                        time.sleep(3)
+                        ws_thread = start_websocket()
+                        ws_state["last_candle_time"] = time.time()
+                        ws_state["reconnecting"] = False
+            else:
+                last_candle_count = max_candles
+                ws_state["last_candle_time"] = time.time()
 
         # Strategy scan every 60s
         if time.time() - last_scan < 60:
@@ -637,7 +682,8 @@ def main():
 
     # ── Shutdown ──
     try:
-        sws.close_connection()
+        if ws_state["sws"]:
+            ws_state["sws"].close_connection()
     except Exception:
         pass
 
