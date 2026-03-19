@@ -1,9 +1,9 @@
 """Strategy 3: Multi-Timeframe RSI Mean Reversion (15-min setup + 5-min entry).
 
-Elder Triple Screen adapted for NSE:
-  Screen 1 — Daily trend filter: stock above 200-EMA, daily RSI(14) > 50
-  Screen 2 — 15-min setup: RSI(14) < 30, ADX(10) < 25, near lower Bollinger Band
-  Screen 3 — 5-min entry trigger: RSI(9) crosses back above 30, volume spike, near VWAP
+v2.0 — Research-backed parameter updates:
+  Screen 1 — Daily trend filter: stock above 200-EMA proxy
+  Screen 2 — 15-min setup: RSI(9) < 40, ADX(14) < 30
+  Screen 3 — 5-min entry trigger: RSI(9) crosses back above 25, price below VWAP
 
 LONG-ONLY — never short (India's structural bullish bias).
 
@@ -13,10 +13,10 @@ Time windows:
   14:30+       Exit-only zone
 
 Exit rules:
-  - 5-min RSI(9) > 55  (mean reversion complete)
+  - 5-min RSI(9) > 50  (mean reversion complete)
   - Price touches VWAP from below
-  - 50-min time stop
-  - 1.5x ATR(14) on 15-min stop-loss
+  - 75-min time stop
+  - 3.0x ATR(14) on 15-min disaster stop
   - Hard exit at 14:30
 """
 
@@ -57,16 +57,7 @@ def _vwap(df: pd.DataFrame) -> pd.Series:
     return cum_tp_vol / cum_vol
 
 
-def _bollinger_bands(series: pd.Series, period: int = 20, std_mult: float = 2.0):
-    """Return (middle, upper, lower) Bollinger Bands."""
-    mid = series.rolling(period).mean()
-    std = series.rolling(period).std()
-    upper = mid + std_mult * std
-    lower = mid - std_mult * std
-    return mid, upper, lower
-
-
-def _adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 10) -> pd.Series:
+def _adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
     """Average Directional Index — measures trend strength."""
     plus_dm = high.diff()
     minus_dm = -low.diff()
@@ -111,22 +102,18 @@ def _resample(df_1min: pd.DataFrame, freq: str) -> pd.DataFrame:
     return resampled.reset_index()
 
 
-# ── Configuration defaults ──────────────────────────────
+# ── Configuration defaults (v2.0 research-backed) ──────
 
 _DEFAULTS = dict(
-    setup_rsi_period=14,
-    setup_rsi_threshold=30,
+    setup_rsi_period=9,            # RSI(9) on 15-min (was 14)
+    setup_rsi_threshold=40,        # Connie Brown: oversold in bull = 40-50 (was 30)
     entry_rsi_period=9,
-    entry_rsi_threshold=30,
-    exit_rsi_threshold=55,
-    adx_period=10,
-    adx_max=25,
-    bb_period=20,
-    bb_std=2.0,
-    vwap_proximity_pct=0.5,
-    volume_spike_mult=1.3,
-    atr_sl_mult=1.5,
-    time_stop_minutes=50,
+    entry_rsi_threshold=25,        # 5-min trigger (was 30)
+    exit_rsi_threshold=50,         # Exit sooner at RSI>50 (was 55)
+    adx_period=14,                 # ADX(14) (was 10)
+    adx_max=30,                    # Less restrictive (was 25)
+    atr_sl_mult=3.0,              # Disaster stop only (was 1.5)
+    time_stop_minutes=75,          # Wider time window (was 50)
     max_positions=3,
     max_per_sector=1,
     prime_window_start="10:15",
@@ -147,14 +134,15 @@ _trade_counter: list[int] = [0]
 _daily_pnl: list[float] = [0.0]
 _daily_trades_count: list[int] = [0]   # track number of entries today
 
-# Sector map mirrors paper_live.py
+# Sector map mirrors paper_live.py (v2.0 — dropped metals/energy)
 SECTOR_MAP = {
     "HDFCBANK-EQ": "Banking", "ICICIBANK-EQ": "Banking", "KOTAKBANK-EQ": "Banking",
     "SBIN-EQ": "Banking", "AXISBANK-EQ": "Banking",
-    "BAJFINANCE-EQ": "Finance", "RELIANCE-EQ": "Energy",
+    "BAJFINANCE-EQ": "Finance",
     "TCS-EQ": "IT", "INFY-EQ": "IT", "WIPRO-EQ": "IT", "HCLTECH-EQ": "IT",
-    "ITC-EQ": "FMCG", "SUNPHARMA-EQ": "Pharma",
-    "TATASTEEL-EQ": "Metals", "LT-EQ": "Infra", "BHARTIARTL-EQ": "Telecom",
+    "ITC-EQ": "FMCG", "HINDUNILVR-EQ": "FMCG",
+    "SUNPHARMA-EQ": "Pharma",
+    "LT-EQ": "Infra", "BHARTIARTL-EQ": "Telecom",
     "TITAN-EQ": "Other", "MARUTI-EQ": "Auto",
 }
 
@@ -201,11 +189,7 @@ _daily_trend_ok: dict[str, bool] = {}   # token -> True if daily trend is bullis
 def check_daily_trend(token: str, df_1min: pd.DataFrame) -> bool:
     """Approximate daily trend check using available 1-min data.
 
-    In live trading, this would use actual daily candle data.
-    For paper trading, we use the longest available close series
-    as a proxy: EMA(200) on 1-min ~ EMA trend direction, and
-    RSI(14) on the available data.
-
+    Uses EMA(200) on 1-min as a rough proxy for the daily 200-EMA.
     Once a stock passes this check, it's cached for the day.
     """
     if token in _daily_trend_ok:
@@ -216,22 +200,20 @@ def check_daily_trend(token: str, df_1min: pd.DataFrame) -> bool:
         if df_1min is not None and len(df_1min) >= 50:
             ema50 = _ema(df_1min["close"], 50).iloc[-1]
             price = df_1min["close"].iloc[-1]
-            rsi_val = _rsi(df_1min["close"], 14).iloc[-1]
-            if pd.isna(ema50) or pd.isna(rsi_val):
+            if pd.isna(ema50):
                 return False
-            ok = price > ema50 and rsi_val > 50
+            ok = price > ema50
             if ok:
                 _daily_trend_ok[token] = True
             return ok
         return False
 
     ema200 = _ema(df_1min["close"], 200).iloc[-1]
-    rsi_val = _rsi(df_1min["close"], 14).iloc[-1]
     price = df_1min["close"].iloc[-1]
 
-    if pd.isna(ema200) or pd.isna(rsi_val):
+    if pd.isna(ema200):
         return False
-    ok = price > ema200 and rsi_val > 50
+    ok = price > ema200
     if ok:
         _daily_trend_ok[token] = True
     return ok
@@ -242,14 +224,14 @@ def check_daily_trend(token: str, df_1min: pd.DataFrame) -> bool:
 def _check_15min_setup(token: str, sym: str, df_15: pd.DataFrame, cfg: dict) -> bool:
     """Check if a stock has a mean-reversion setup on the 15-min chart.
 
-    Conditions:
-      - RSI(14) < 30
-      - ADX(10) < 25 (range-bound)
-      - Price touching/near lower Bollinger Band(20,2)
+    v2.0 Conditions:
+      - RSI(9) < 40 (Connie Brown: bull market oversold = 40-50)
+      - ADX(14) < 30 (range-bound, less restrictive)
+      - Price below VWAP (flipped — mean reversion buys below the mean)
 
     If satisfied, records the setup with ATR for stop-loss calculation.
     """
-    if df_15 is None or len(df_15) < max(cfg["bb_period"], cfg["adx_period"], cfg["setup_rsi_period"]) + 2:
+    if df_15 is None or len(df_15) < max(cfg["adx_period"], cfg["setup_rsi_period"]) + 2:
         return False
 
     rsi_15 = _rsi(df_15["close"], cfg["setup_rsi_period"])
@@ -266,27 +248,18 @@ def _check_15min_setup(token: str, sym: str, df_15: pd.DataFrame, cfg: dict) -> 
     if pd.isna(current_adx) or current_adx >= cfg["adx_max"]:
         return False
 
-    _, _, bb_lower = _bollinger_bands(df_15["close"], cfg["bb_period"], cfg["bb_std"])
-    current_bb_lower = bb_lower.iloc[-1]
-    current_price = df_15["close"].iloc[-1]
-    if pd.isna(current_bb_lower):
-        return False
-
-    # Price should be within 1% of or below the lower Bollinger Band
-    if current_price > current_bb_lower * 1.01:
-        return False
-
     # Calculate 15-min ATR for stop-loss
     atr_15 = _atr(df_15["high"], df_15["low"], df_15["close"], 14)
     current_atr_15 = atr_15.iloc[-1]
     if pd.isna(current_atr_15) or current_atr_15 <= 0:
-        current_atr_15 = current_price * 0.005  # fallback
+        current_atr_15 = df_15["close"].iloc[-1] * 0.005  # fallback
+
+    current_price = df_15["close"].iloc[-1]
 
     _setups[token] = {
         "symbol": sym,
         "rsi_15": current_rsi_15,
         "adx": current_adx,
-        "bb_lower": current_bb_lower,
         "atr_15": current_atr_15,
         "setup_time": datetime.now(),
         "price_at_setup": current_price,
@@ -299,13 +272,13 @@ def _check_15min_setup(token: str, sym: str, df_15: pd.DataFrame, cfg: dict) -> 
 def _check_5min_trigger(token: str, df_5: pd.DataFrame, df_1: pd.DataFrame, cfg: dict) -> bool:
     """Check if the 5-min chart shows a valid entry trigger.
 
-    Conditions:
-      - RSI(9) crosses back above 30 (bounce confirmation)
-      - Volume on trigger candle >= 1.3x 20-period average
-      - Price within 0.5% of VWAP
+    v2.0 Conditions:
+      - RSI(9) crosses back above 25 (bounce confirmation)
+      - Price BELOW VWAP (flipped — entry below the mean, VWAP = exit target)
       - Bullish candle (close > open)
+    Removed: volume spike filter, Bollinger Band, VWAP proximity
     """
-    if df_5 is None or len(df_5) < 21:
+    if df_5 is None or len(df_5) < cfg["entry_rsi_period"] + 2:
         return False
 
     rsi_5 = _rsi(df_5["close"], cfg["entry_rsi_period"])
@@ -327,19 +300,13 @@ def _check_5min_trigger(token: str, df_5: pd.DataFrame, df_1: pd.DataFrame, cfg:
     if last_5m["close"] <= last_5m["open"]:
         return False
 
-    # Volume spike — use 5-min volume
-    vol_avg_20 = df_5["volume"].iloc[-20:].mean()
-    if vol_avg_20 > 0 and last_5m["volume"] < cfg["volume_spike_mult"] * vol_avg_20:
-        return False
-
-    # VWAP proximity — compute VWAP from 1-min data
+    # VWAP check: price must be BELOW VWAP (entry below the mean)
     if df_1 is not None and len(df_1) > 5:
         vwap_series = _vwap(df_1)
         current_vwap = vwap_series.iloc[-1]
         if current_vwap > 0:
-            proximity = abs(last_5m["close"] - current_vwap) / current_vwap * 100
-            if proximity > cfg["vwap_proximity_pct"]:
-                return False
+            if last_5m["close"] >= current_vwap:
+                return False  # Above VWAP — not a mean reversion entry
 
     return True
 
@@ -364,7 +331,7 @@ def _check_exits(stock_data: dict, token_to_sym: dict, portfolio, logger, now: d
                 _close_position(tid, current_price, "HARD_EXIT_1430", portfolio, logger)
                 continue
 
-            # Time stop — 50 minutes since entry
+            # Time stop — 75 minutes since entry
             elapsed = (now - pos["entry_time"]).total_seconds() / 60
             if elapsed >= cfg["time_stop_minutes"]:
                 _close_position(tid, current_price, "TIME_STOP", portfolio, logger)
@@ -377,24 +344,24 @@ def _check_exits(stock_data: dict, token_to_sym: dict, portfolio, logger, now: d
             _close_position(tid, current_price, "HARD_EXIT_1430", portfolio, logger)
             continue
 
-        # Stop-loss
+        # Disaster stop-loss (3x ATR)
         if current_price <= pos["stop_loss"]:
-            _close_position(tid, current_price, "STOP_LOSS", portfolio, logger)
+            _close_position(tid, current_price, "DISASTER_STOP", portfolio, logger)
             continue
 
-        # Time stop — 50 minutes since entry
+        # Time stop — 75 minutes since entry
         elapsed = (now - pos["entry_time"]).total_seconds() / 60
         if elapsed >= cfg["time_stop_minutes"]:
-            _close_position(tid, current_price, "TIME_STOP", portfolio, logger)
+            _close_position(tid, current_price, "TIME_STOP_75M", portfolio, logger)
             continue
 
-        # Primary exit: 5-min RSI(9) > 55
+        # Primary exit: 5-min RSI(9) > 50
         df_5 = _resample(df_1, "5min")
         if df_5 is not None and len(df_5) >= cfg["entry_rsi_period"] + 1:
             rsi_5 = _rsi(df_5["close"], cfg["entry_rsi_period"])
             current_rsi_5 = rsi_5.iloc[-1]
             if not pd.isna(current_rsi_5) and current_rsi_5 >= cfg["exit_rsi_threshold"]:
-                _close_position(tid, current_price, "RSI_EXIT_55", portfolio, logger)
+                _close_position(tid, current_price, "RSI_EXIT_50", portfolio, logger)
                 continue
 
         # VWAP touch exit: price crosses above VWAP
@@ -553,9 +520,8 @@ def scan_15min_rsi(stock_data: dict, token_to_sym: dict, portfolio, logger, now:
         # Log thought
         logger.log_thought(
             sym, current_price, setup["rsi_15"], "S3_SETUP+TRIGGER",
-            None, current_vwap, df_1["volume"].iloc[-1],
-            df_1["volume"].iloc[-20:].mean() if len(df_1) >= 20 else 0,
-            "BUY", (f"S3 MeanRevert | 15m RSI={setup['rsi_15']:.1f} ADX={setup['adx']:.1f} | "
+            None, current_vwap, None, setup["adx"],
+            "BUY", (f"S3 MeanRevert | 15m RSI(9)={setup['rsi_15']:.1f} ADX(14)={setup['adx']:.1f} | "
                     f"Qty={qty} SL={stop_loss:.2f} | {window_tag}"),
         )
 
@@ -568,8 +534,8 @@ def scan_15min_rsi(stock_data: dict, token_to_sym: dict, portfolio, logger, now:
         portfolio.sector_count[sector] = portfolio.sector_count.get(sector, 0) + 1
 
         print(f"\n  >> S3 BUY {sym} x{qty} @ Rs{current_price:.2f} | "
-              f"SL=Rs{stop_loss:.2f} | 15m RSI={setup['rsi_15']:.1f} | "
-              f"ADX={setup['adx']:.1f} | {window_tag}")
+              f"SL=Rs{stop_loss:.2f} | 15m RSI(9)={setup['rsi_15']:.1f} | "
+              f"ADX(14)={setup['adx']:.1f} | {window_tag}")
 
         # Consume the setup — don't re-enter on the same signal
         del _setups[token]

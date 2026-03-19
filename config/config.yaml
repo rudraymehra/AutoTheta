@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════
-# AutoTheta — Multi-Strategy Trading Bot Config
+# AutoTheta v2.0 — Research-Backed Strategy Config
 # ═══════════════════════════════════════════════
 
 bot:
@@ -17,35 +17,43 @@ broker:
 
 # Global risk limits (across ALL strategies)
 risk:
-  max_daily_loss: 15000         # ₹15K total daily loss cap
-  max_total_exposure: 500000    # ₹5L total position value
+  max_daily_loss: 15000         # Rs 15K total daily loss cap
+  max_total_exposure: 500000    # Rs 5L total position value
+
+# VIX regime sizing (checked once at startup)
+vix:
+  full_threshold: 18            # VIX < 18: full size
+  half_threshold: 22            # VIX 18-22: half size (Rs 1,250 risk)
+  suspend_above: 22             # VIX > 22: no trades
 
 # ─── Strategy Definitions ───
 strategies:
 
-  # ━━━ Strategy 1: RSI Oversold Bounce on Nifty 50 Stocks ━━━
+  # ━━━ Strategy 1: RSI(4) Mean Reversion on 5-min Candles (v2.0) ━━━
   - strategy:
-      name: "RSI_Bounce_Nifty50"
+      name: "RSI4_MeanRevert_5min"
       type: "rsi_bounce"
       enabled: true
     parameters:
-      rsi_period: 7                    # RSI(7) — faster than default 14
-      oversold_threshold: 20           # Entry when RSI < 20
-      exit_1_rsi: 40                   # First partial exit (50%) at RSI 40
-      exit_2_rsi: 50                   # Final exit at RSI 50
-      atr_sl_multiplier: 1.5           # SL = 1.5 × ATR(14) below entry
-      time_stop_candles: 15            # Exit if RSI hasn't hit 40 in 15 candles
-      skip_first_minutes: 15           # Skip 9:15-9:30 opening noise
-      max_positions: 4                 # Max simultaneous positions
-      max_per_sector: 1                # Max 1 banking stock etc
-      volume_spike_multiplier: 1.5     # Volume must be 1.5x 20-period avg
-      adx_threshold: 20                # ADX must be > 20
-      market_wide_threshold: 10        # If >10 stocks trigger, reduce activity
+      rsi_period: 4                    # RSI(4) on 5-min candles
+      oversold_threshold: 15           # Entry when RSI < 15, then hook back above
+      exit_rsi: 50                     # 40% position exits at RSI(4) > 50
+      atr_sl_multiplier: 3.0           # 3x ATR(14) on 15-min = disaster stop only
+      time_stop_minutes: 75            # 75-minute time stop
+      entry_start: "10:15"             # No entries before 10:15 AM
+      entry_end: "14:00"               # No entries after 2:00 PM
+      hard_exit: "15:00"               # Close everything by 3:00 PM
+      max_positions: 3                 # Max 3 concurrent positions
+      max_per_sector: 1                # Max 1 per sector
+      adx_max: 25                      # 15-min ADX(14) must be < 25 (range-bound)
+      vwap_below_min_pct: 0.3          # Price must be 0.3-1.2% below VWAP
+      vwap_below_max_pct: 1.2
+      vwap_exit_pct: 60               # Exit 60% of position at VWAP touch
     risk:
-      capital_allocation: 250000       # ₹2.5L allocated
-      risk_per_trade_pct: 1.0          # Max 1% risk per trade (₹2,500)
-      daily_loss_cap: 7500             # ₹7,500 daily cap for this strategy
-      max_positions: 4
+      capital_allocation: 250000       # Rs 2.5L allocated
+      risk_per_trade_pct: 1.0          # Max 1% risk per trade (Rs 2,500)
+      daily_loss_cap: 7500             # Rs 7,500 daily cap for this strategy
+      max_positions: 3
       max_consecutive_losses: 3        # Cooldown after 3 losses in a row
       cooldown_minutes: 30             # 30-min cooldown
 
@@ -75,32 +83,28 @@ strategies:
       max_consecutive_losses: 3
       cooldown_minutes: 0              # No cooldown (weekly strategy)
 
-  # ━━━ Strategy 3: Multi-Timeframe RSI Mean Reversion (15-min setup + 5-min entry) ━━━
+  # ━━━ Strategy 3: Multi-Timeframe RSI Mean Reversion (v2.0) ━━━
   - strategy:
       name: "RSI_15min_MeanRevert"
       type: "rsi_15min"
       enabled: true
     parameters:
-      setup_rsi_period: 14          # RSI(14) on 15-min chart
-      setup_rsi_threshold: 30       # Setup when RSI < 30
-      entry_rsi_period: 9           # RSI(9) on 5-min chart
-      entry_rsi_threshold: 30       # Entry when 5-min RSI crosses back above 30
-      exit_rsi_threshold: 55        # Exit when 5-min RSI > 55
-      adx_period: 10                # ADX(10) — faster than default 14
-      adx_max: 25                   # Only trade when ADX < 25 (range-bound)
-      bb_period: 20                 # Bollinger Band period
-      bb_std: 2                     # Bollinger Band std dev
-      vwap_proximity_pct: 0.5       # Price must be within 0.5% of VWAP
-      volume_spike_mult: 1.3        # Volume >= 1.3x average
-      atr_sl_mult: 1.5              # Wide stop: 1.5x ATR(14) on 15-min
-      time_stop_minutes: 50         # Exit if no recovery in 50 min
+      setup_rsi_period: 9             # RSI(9) on 15-min chart (was 14)
+      setup_rsi_threshold: 40         # Connie Brown: oversold in bull = 40 (was 30)
+      entry_rsi_period: 9             # RSI(9) on 5-min chart
+      entry_rsi_threshold: 25         # Entry when 5-min RSI crosses back above 25 (was 30)
+      exit_rsi_threshold: 50          # Exit when 5-min RSI > 50 (was 55)
+      adx_period: 14                  # ADX(14) — standard (was 10)
+      adx_max: 30                     # Less restrictive (was 25)
+      atr_sl_mult: 3.0               # Disaster stop: 3x ATR(14) on 15-min (was 1.5)
+      time_stop_minutes: 75           # Wider time window (was 50)
       max_positions: 3
       max_per_sector: 1
       prime_window_start: "10:15"
       prime_window_end: "12:00"
       secondary_window_start: "13:30"
       secondary_window_end: "14:30"
-      secondary_size_mult: 0.5      # Half size in secondary window
+      secondary_size_mult: 0.5        # Half size in secondary window
     risk:
       capital_allocation: 250000
       risk_per_trade_pct: 1.0

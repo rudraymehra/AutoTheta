@@ -1,5 +1,9 @@
 """Simulate a range of trading days and produce a summary table.
 
+v2.0 — Research-backed parameters:
+  S1: RSI(4) on 5-min, hook above 15, VWAP below, 3x ATR, 75-min time stop
+  S3: RSI(9)<40 on 15-min, RSI(9) cross above 25 on 5-min, ADX(14)<30, 3x ATR
+
 Usage: python simulate_range.py 2026-02-03 2026-02-13
 """
 
@@ -21,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env")
 
 # ── Indicators ──
-def rsi(series, period=7):
+def rsi(series, period=4):
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -44,12 +48,7 @@ def vwap_calc(df):
     tp = (df["high"] + df["low"] + df["close"]) / 3
     return (tp * df["volume"]).cumsum() / df["volume"].cumsum().replace(0, 1)
 
-def bollinger_bands(series, period=20, std=2):
-    mid = series.rolling(period).mean()
-    s = series.rolling(period).std()
-    return mid, mid + std * s, mid - std * s
-
-def adx_calc(high, low, close, period=10):
+def adx_calc(high, low, close, period=14):
     plus_dm = high.diff()
     minus_dm = -low.diff()
     plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
@@ -62,13 +61,15 @@ def adx_calc(high, low, close, period=10):
     return dx.ewm(alpha=1/period, min_periods=period).mean()
 
 
+# v2.0 stock universe — dropped metals/energy
 SECTOR_MAP = {
     "HDFCBANK-EQ": "Banking", "ICICIBANK-EQ": "Banking", "KOTAKBANK-EQ": "Banking",
     "SBIN-EQ": "Banking", "AXISBANK-EQ": "Banking",
-    "BAJFINANCE-EQ": "Finance", "RELIANCE-EQ": "Energy",
+    "BAJFINANCE-EQ": "Finance",
     "TCS-EQ": "IT", "INFY-EQ": "IT", "WIPRO-EQ": "IT", "HCLTECH-EQ": "IT",
-    "ITC-EQ": "FMCG", "SUNPHARMA-EQ": "Pharma",
-    "TATASTEEL-EQ": "Metals", "LT-EQ": "Infra", "BHARTIARTL-EQ": "Telecom",
+    "ITC-EQ": "FMCG", "HINDUNILVR-EQ": "FMCG",
+    "SUNPHARMA-EQ": "Pharma",
+    "LT-EQ": "Infra", "BHARTIARTL-EQ": "Telecom",
     "TITAN-EQ": "Other", "MARUTI-EQ": "Auto",
 }
 
@@ -125,40 +126,40 @@ def simulate_one_day(data):
 
     # Precompute indicators
     for sym, df in data.items():
-        df["rsi7"] = rsi(df["close"], 7)
         df["atr14"] = atr_calc(df["high"], df["low"], df["close"], 14)
+        df["ema200"] = ema(df["close"], 200)
         df["vwap"] = vwap_calc(df)
-        df["vol_avg20"] = df["volume"].rolling(20).mean()
 
+        # 5-min resampled
         df_5m = df.set_index("timestamp").resample("5min").agg({
             "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum",
         }).dropna().reset_index()
-        if len(df_5m) >= 20:
-            df_5m["ema20"] = ema(df_5m["close"], 20)
-            df["ema20_5m"] = None
+        if len(df_5m) >= 5:
+            df_5m["rsi4"] = rsi(df_5m["close"], 4)
+            df["rsi4_5m"] = None
             for _, bar in df_5m.iterrows():
                 mask = (df["timestamp"] >= bar["timestamp"]) & (df["timestamp"] < bar["timestamp"] + pd.Timedelta(minutes=5))
-                df.loc[mask, "ema20_5m"] = bar["ema20"]
-            df["ema20_5m"] = df["ema20_5m"].ffill()
+                df.loc[mask, "rsi4_5m"] = bar.get("rsi4")
+            df["rsi4_5m"] = df["rsi4_5m"].ffill()
 
+        # 15-min resampled
         df_15m = df.set_index("timestamp").resample("15min").agg({
             "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum",
         }).dropna().reset_index()
         if len(df_15m) >= 5:
-            df_15m["rsi14"] = rsi(df_15m["close"], 14)
-            df_15m["adx10"] = adx_calc(df_15m["high"], df_15m["low"], df_15m["close"], 10)
-            _, _, bb_l = bollinger_bands(df_15m["close"], 20, 2)
-            df_15m["bb_lower"] = bb_l
+            df_15m["adx14"] = adx_calc(df_15m["high"], df_15m["low"], df_15m["close"], 14)
             df_15m["atr14"] = atr_calc(df_15m["high"], df_15m["low"], df_15m["close"], 14)
-            for col in ["rsi14", "adx10", "bb_lower", "atr14"]:
+            df_15m["rsi9"] = rsi(df_15m["close"], 9)
+            for col in ["adx14", "atr14", "rsi9"]:
                 df[f"{col}_15m"] = None
                 for _, bar in df_15m.iterrows():
                     mask = (df["timestamp"] >= bar["timestamp"]) & (df["timestamp"] < bar["timestamp"] + pd.Timedelta(minutes=15))
                     df.loc[mask, f"{col}_15m"] = bar.get(col)
                 df[f"{col}_15m"] = df[f"{col}_15m"].ffill()
 
-        df_5m["rsi9"] = rsi(df_5m["close"], 9) if len(df_5m) >= 10 else None
-        if df_5m["rsi9"] is not None:
+        # 5-min RSI(9) for S3
+        if len(df_5m) >= 10:
+            df_5m["rsi9"] = rsi(df_5m["close"], 9)
             df["rsi9_5m"] = None
             for _, bar in df_5m.iterrows():
                 mask = (df["timestamp"] >= bar["timestamp"]) & (df["timestamp"] < bar["timestamp"] + pd.Timedelta(minutes=5))
@@ -208,28 +209,42 @@ def simulate_one_day(data):
             pos["candles_held"] += 1
 
             if pos["strategy"] == "S1":
-                r7 = row["rsi7"]
+                r4 = row.get("rsi4_5m")
                 if row["close"] <= pos["stop_loss"]:
                     pos["realized_pnl"] += (row["close"] - pos["entry_price"]) * pos["remaining"]
-                    closed.append({**pos, "exit_price": row["close"], "exit_reason": "SL"})
+                    closed.append({**pos, "exit_price": row["close"], "exit_reason": "DISASTER_SL"})
                     sector_count[pos["sector"]] = max(0, sector_count[pos["sector"]] - 1)
                     del positions[tid]
                     continue
-                if pos["candles_held"] >= 15 and (pd.isna(r7) or r7 < 40):
+                if hour >= 15:
                     pos["realized_pnl"] += (row["close"] - pos["entry_price"]) * pos["remaining"]
-                    closed.append({**pos, "exit_price": row["close"], "exit_reason": "TIME"})
+                    closed.append({**pos, "exit_price": row["close"], "exit_reason": "HARD_3PM"})
                     sector_count[pos["sector"]] = max(0, sector_count[pos["sector"]] - 1)
                     del positions[tid]
                     continue
-                if pos["status"] == "open" and not pd.isna(r7) and r7 >= 40:
-                    eq = pos["remaining"] // 2
+                if pos["candles_held"] >= 75:
+                    pos["realized_pnl"] += (row["close"] - pos["entry_price"]) * pos["remaining"]
+                    closed.append({**pos, "exit_price": row["close"], "exit_reason": "TIME75"})
+                    sector_count[pos["sector"]] = max(0, sector_count[pos["sector"]] - 1)
+                    del positions[tid]
+                    continue
+                # VWAP touch: 60% exit
+                if not pos.get("vwap_exit_done") and row["close"] >= row["vwap"]:
+                    eq = int(pos["initial_qty"] * 0.6)
+                    eq = min(eq, pos["remaining"])
                     if eq > 0:
                         pos["realized_pnl"] += (row["close"] - pos["entry_price"]) * eq
                         pos["remaining"] -= eq
-                        pos["status"] = "partial"
-                elif pos["status"] == "partial" and not pd.isna(r7) and r7 >= 50:
+                        pos["vwap_exit_done"] = True
+                        if pos["remaining"] <= 0:
+                            closed.append({**pos, "exit_price": row["close"], "exit_reason": "VWAP60"})
+                            sector_count[pos["sector"]] = max(0, sector_count[pos["sector"]] - 1)
+                            del positions[tid]
+                            continue
+                # RSI(4) > 50: remaining exit
+                if not pd.isna(r4) and r4 >= 50:
                     pos["realized_pnl"] += (row["close"] - pos["entry_price"]) * pos["remaining"]
-                    closed.append({**pos, "exit_price": row["close"], "exit_reason": "RSI50"})
+                    closed.append({**pos, "exit_price": row["close"], "exit_reason": "RSI4_50"})
                     sector_count[pos["sector"]] = max(0, sector_count[pos["sector"]] - 1)
                     del positions[tid]
 
@@ -247,60 +262,84 @@ def simulate_one_day(data):
                     sector_count[pos["sector"]] = max(0, sector_count[pos["sector"]] - 1)
                     del positions[tid]
                     continue
-                if pos["candles_held"] >= 50:
+                if pos["candles_held"] >= 75:
                     pos["realized_pnl"] += (row["close"] - pos["entry_price"]) * pos["remaining"]
-                    closed.append({**pos, "exit_price": row["close"], "exit_reason": "S3_TIME"})
+                    closed.append({**pos, "exit_price": row["close"], "exit_reason": "S3_TIME75"})
                     sector_count[pos["sector"]] = max(0, sector_count[pos["sector"]] - 1)
                     del positions[tid]
                     continue
-                if not pd.isna(r9) and r9 >= 55:
+                if not pd.isna(r9) and r9 >= 50:
                     pos["realized_pnl"] += (row["close"] - pos["entry_price"]) * pos["remaining"]
-                    closed.append({**pos, "exit_price": row["close"], "exit_reason": "S3_RSI55"})
+                    closed.append({**pos, "exit_price": row["close"], "exit_reason": "S3_RSI50"})
+                    sector_count[pos["sector"]] = max(0, sector_count[pos["sector"]] - 1)
+                    del positions[tid]
+                    continue
+                if row["close"] >= row["vwap"] and pos.get("entered_below_vwap"):
+                    pos["realized_pnl"] += (row["close"] - pos["entry_price"]) * pos["remaining"]
+                    closed.append({**pos, "exit_price": row["close"], "exit_reason": "S3_VWAP"})
                     sector_count[pos["sector"]] = max(0, sector_count[pos["sector"]] - 1)
                     del positions[tid]
 
-        # S1 entries
-        for sym, df in data.items():
-            if i >= len(df):
-                continue
-            row = df.iloc[i]
-            prev = df.iloc[i - 1]
-            if pd.isna(row["rsi7"]) or pd.isna(prev["rsi7"]):
-                continue
-            if not (prev["rsi7"] >= 20 and row["rsi7"] < 20):
-                continue
-            s1_signals += 1
-            if any(p["symbol"] == sym for p in positions.values()):
-                continue
-            s1_pos = sum(1 for p in positions.values() if p["strategy"] == "S1")
-            if s1_pos >= 4:
-                continue
-            sector = SECTOR_MAP.get(sym, "Other")
-            if sector_count.get(sector, 0) >= 1:
-                continue
-            e5 = row.get("ema20_5m")
-            if pd.notna(e5) and row["close"] < e5:
-                continue
-            if row["close"] < row["vwap"] * 0.998:
-                continue
-            if pd.notna(row["vol_avg20"]) and row["vol_avg20"] > 0 and row["volume"] < row["vol_avg20"] * 1.5:
-                continue
-            a = row["atr14"] if pd.notna(row["atr14"]) else row["close"] * 0.005
-            sl = round(row["close"] - 1.5 * a, 2)
-            risk = row["close"] - sl
-            if risk <= 0:
-                continue
-            qty = min(int(RISK_PER_TRADE / risk), int(83000 / row["close"]))
-            if qty <= 0:
-                continue
-            trade_count += 1
-            positions[f"S1-{trade_count}"] = {
-                "strategy": "S1", "symbol": sym, "entry_price": row["close"],
-                "quantity": qty, "remaining": qty, "stop_loss": sl, "status": "open",
-                "entry_time": ts.strftime("%H:%M"), "candles_held": 0,
-                "realized_pnl": 0.0, "sector": sector,
-            }
-            sector_count[sector] += 1
+        # S1 entries — 10:15-14:00 only
+        now_min = hour * 60 + minute
+        s1_entry_ok = (10 * 60 + 15) <= now_min < (14 * 60)
+
+        if s1_entry_ok:
+            for sym, df in data.items():
+                if i >= len(df) or i < 1:
+                    continue
+                row = df.iloc[i]
+                prev = df.iloc[i - 1]
+                curr_r4 = row.get("rsi4_5m")
+                prev_r4 = prev.get("rsi4_5m")
+                if curr_r4 is None or prev_r4 is None:
+                    continue
+                if pd.isna(curr_r4) or pd.isna(prev_r4):
+                    continue
+                # RSI(4) hook: prev < 15 AND current >= 15
+                if not (prev_r4 < 15 and curr_r4 >= 15):
+                    continue
+                s1_signals += 1
+                if any(p["symbol"] == sym for p in positions.values()):
+                    continue
+                s1_pos = sum(1 for p in positions.values() if p["strategy"] == "S1")
+                if s1_pos >= 3:
+                    continue
+                sector = SECTOR_MAP.get(sym, "Other")
+                if sector_count.get(sector, 0) >= 1:
+                    continue
+                # EMA(200) filter
+                e200 = row.get("ema200")
+                if pd.notna(e200) and row["close"] < e200:
+                    continue
+                # ADX filter
+                adx15 = row.get("adx14_15m")
+                if pd.notna(adx15) and adx15 >= 25:
+                    continue
+                # VWAP below: 0.3%-1.2%
+                vd = (row["close"] - row["vwap"]) / max(row["vwap"], 1) if row["vwap"] > 0 else 0
+                if not (-0.012 <= vd <= -0.003):
+                    continue
+                # 3x ATR on 15-min
+                a15 = row.get("atr14_15m")
+                a = a15 if pd.notna(a15) else row["close"] * 0.01
+                sl = round(row["close"] - 3.0 * a, 2)
+                risk = row["close"] - sl
+                if risk <= 0:
+                    continue
+                qty = min(int(RISK_PER_TRADE / risk), int(83000 / row["close"]))
+                if qty <= 0:
+                    continue
+                trade_count += 1
+                positions[f"S1-{trade_count}"] = {
+                    "strategy": "S1", "symbol": sym, "entry_price": row["close"],
+                    "quantity": qty, "initial_qty": qty, "remaining": qty,
+                    "stop_loss": sl, "status": "open",
+                    "entry_time": ts.strftime("%H:%M"), "candles_held": 0,
+                    "realized_pnl": 0.0, "sector": sector,
+                    "vwap_exit_done": False,
+                }
+                sector_count[sector] += 1
 
         # S3 entries
         in_prime = (hour == 10 and minute >= 15) or hour == 11
@@ -310,26 +349,23 @@ def simulate_one_day(data):
                 if i >= len(df):
                     continue
                 row = df.iloc[i]
-                r14_15 = row.get("rsi14_15m")
-                adx_15 = row.get("adx10_15m")
+                r9_15 = row.get("rsi9_15m")
+                adx_15 = row.get("adx14_15m")
                 r9_5 = row.get("rsi9_5m")
-                bb_l = row.get("bb_lower_15m")
                 atr_15 = row.get("atr14_15m")
-                if any(v is None or (isinstance(v, float) and pd.isna(v)) for v in [r14_15, adx_15, r9_5]):
+                if any(v is None or (isinstance(v, float) and pd.isna(v)) for v in [r9_15, adx_15, r9_5]):
                     continue
-                if r14_15 >= 30 or adx_15 >= 25:
+                # RSI(9) < 40, ADX(14) < 30
+                if r9_15 >= 40 or adx_15 >= 30:
                     continue
                 s3_setups += 1
-                if pd.notna(bb_l) and row["close"] > bb_l * 1.01:
-                    continue
                 prev_r9 = df.iloc[i-1].get("rsi9_5m") if i > 0 else None
-                if prev_r9 is None or pd.isna(prev_r9) or not (prev_r9 < 30 and r9_5 >= 30):
+                if prev_r9 is None or pd.isna(prev_r9) or not (prev_r9 < 25 and r9_5 >= 25):
                     continue
                 if row["close"] <= row["open"]:
                     continue
-                if pd.notna(row["vol_avg20"]) and row["vol_avg20"] > 0 and row["volume"] < row["vol_avg20"] * 1.3:
-                    continue
-                if abs(row["close"] - row["vwap"]) / max(row["vwap"], 1) > 0.005:
+                # Below VWAP
+                if row["close"] >= row["vwap"]:
                     continue
                 if any(p["symbol"] == sym for p in positions.values()):
                     continue
@@ -337,7 +373,7 @@ def simulate_one_day(data):
                 if s3_pos >= 3:
                     continue
                 a15 = atr_15 if pd.notna(atr_15) else row["close"] * 0.008
-                sl = round(row["close"] - 1.5 * a15, 2)
+                sl = round(row["close"] - 3.0 * a15, 2)
                 risk = row["close"] - sl
                 if risk <= 0:
                     continue
@@ -346,13 +382,16 @@ def simulate_one_day(data):
                 if qty <= 0:
                     continue
                 trade_count += 1
+                sector = SECTOR_MAP.get(sym, "Other")
                 positions[f"S3-{trade_count}"] = {
                     "strategy": "S3", "symbol": sym, "entry_price": row["close"],
-                    "quantity": qty, "remaining": qty, "stop_loss": sl, "status": "open",
+                    "quantity": qty, "initial_qty": qty, "remaining": qty,
+                    "stop_loss": sl, "status": "open",
                     "entry_time": ts.strftime("%H:%M"), "candles_held": 0,
                     "realized_pnl": 0.0, "sector": sector,
+                    "entered_below_vwap": row["close"] < row["vwap"],
                 }
-                sector_count[SECTOR_MAP.get(sym, "Other")] += 1
+                sector_count[sector] += 1
 
     s1_trades = [t for t in closed if t["strategy"] == "S1"]
     s3_trades = [t for t in closed if t["strategy"] == "S3"]
@@ -381,7 +420,7 @@ def main():
     days = get_trading_days(start, end)
 
     print(f"{'='*80}")
-    print(f"  AutoTheta Range Simulation: {start} to {end} ({len(days)} trading days)")
+    print(f"  AutoTheta Range Simulation v2.0: {start} to {end} ({len(days)} trading days)")
     print(f"{'='*80}")
 
     # Auth
@@ -419,7 +458,7 @@ def main():
 
     # ── Summary Table ──
     print(f"\n{'='*80}")
-    print(f"  RESULTS: {start} to {end}")
+    print(f"  RESULTS v2.0: {start} to {end}")
     print(f"{'='*80}")
     print()
     print(f"  {'Date':12s} {'Day':4s} {'S1 Sig':>7s} {'S1 Trd':>7s} {'S1 W/L':>7s} {'S1 P&L':>10s} {'S3 Set':>7s} {'S3 Trd':>7s} {'S3 W/L':>7s} {'S3 P&L':>10s} {'TOTAL':>10s}")
