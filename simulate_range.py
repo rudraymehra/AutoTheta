@@ -312,13 +312,13 @@ def simulate_one_day(data):
                 e200 = row.get("ema200")
                 if pd.notna(e200) and row["close"] < e200:
                     continue
-                # ADX filter
+                # ADX filter — range-bound only
                 adx15 = row.get("adx14_15m")
-                if pd.notna(adx15) and adx15 >= 25:
+                if pd.notna(adx15) and adx15 >= 30:
                     continue
-                # VWAP below: 0.3%-1.2%
+                # VWAP below: 0.1%-2.0% (wider window)
                 vd = (row["close"] - row["vwap"]) / max(row["vwap"], 1) if row["vwap"] > 0 else 0
-                if not (-0.012 <= vd <= -0.003):
+                if not (-0.020 <= vd <= -0.001):
                     continue
                 # 3x ATR on 15-min
                 a15 = row.get("atr14_15m")
