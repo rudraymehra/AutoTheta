@@ -74,3 +74,34 @@ strategies:
       max_positions: 1                 # Only 1 iron condor at a time
       max_consecutive_losses: 3
       cooldown_minutes: 0              # No cooldown (weekly strategy)
+
+  # ━━━ Strategy 3: Multi-Timeframe RSI Mean Reversion (15-min setup + 5-min entry) ━━━
+  - strategy:
+      name: "RSI_15min_MeanRevert"
+      type: "rsi_15min"
+      enabled: true
+    parameters:
+      setup_rsi_period: 14          # RSI(14) on 15-min chart
+      setup_rsi_threshold: 30       # Setup when RSI < 30
+      entry_rsi_period: 9           # RSI(9) on 5-min chart
+      entry_rsi_threshold: 30       # Entry when 5-min RSI crosses back above 30
+      exit_rsi_threshold: 55        # Exit when 5-min RSI > 55
+      adx_period: 10                # ADX(10) — faster than default 14
+      adx_max: 25                   # Only trade when ADX < 25 (range-bound)
+      bb_period: 20                 # Bollinger Band period
+      bb_std: 2                     # Bollinger Band std dev
+      vwap_proximity_pct: 0.5       # Price must be within 0.5% of VWAP
+      volume_spike_mult: 1.3        # Volume >= 1.3x average
+      atr_sl_mult: 1.5              # Wide stop: 1.5x ATR(14) on 15-min
+      time_stop_minutes: 50         # Exit if no recovery in 50 min
+      max_positions: 3
+      max_per_sector: 1
+      prime_window_start: "10:15"
+      prime_window_end: "12:00"
+      secondary_window_start: "13:30"
+      secondary_window_end: "14:30"
+      secondary_size_mult: 0.5      # Half size in secondary window
+    risk:
+      capital_allocation: 250000
+      risk_per_trade_pct: 1.0
+      daily_loss_cap: 7500

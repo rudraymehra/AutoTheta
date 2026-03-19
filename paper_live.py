@@ -28,6 +28,8 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env")
 
+from strategies.rsi_15min import scan_15min_rsi, reset_state as reset_s3_state, get_positions as get_s3_positions, get_daily_pnl as get_s3_pnl
+
 API_KEY = os.getenv("ANGEL_API_KEY")
 CLIENT_ID = os.getenv("ANGEL_CLIENT_ID")
 PASSWORD = os.getenv("ANGEL_PASSWORD")
@@ -339,6 +341,7 @@ class PaperPortfolio:
 # ══════════════════════════════════════════
 def main():
     logger = DailyLogger()
+    reset_s3_state()  # Clear Strategy 3 state for new day
 
     print("=" * 70)
     print(f"  AutoTheta PAPER TRADING — WebSocket Mode")
@@ -480,11 +483,14 @@ def main():
             max_candles = max(candle_counts.values()) if candle_counts else 0
             active = sum(1 for c in candle_counts.values() if c > 0)
             now = datetime.now()
-            pnl_pct = (portfolio.daily_pnl / portfolio.capital) * 100
+            s3_positions = get_s3_positions()
+            total_positions = len(portfolio.positions) + len(s3_positions)
+            combined_pnl = portfolio.daily_pnl + get_s3_pnl()
+            pnl_pct = (combined_pnl / portfolio.capital) * 100
             print(f"\r  [{now.strftime('%H:%M:%S')}] "
                   f"Candles: {max_candles} | Feeds: {active}/{len(token_map)} | "
-                  f"Positions: {len(portfolio.positions)} | "
-                  f"P&L: Rs{portfolio.daily_pnl:+,.2f} ({pnl_pct:+.2f}%)",
+                  f"Pos: S1={len(portfolio.positions)} S3={len(s3_positions)} | "
+                  f"P&L: Rs{combined_pnl:+,.2f} ({pnl_pct:+.2f}%)",
                   end="", flush=True)
 
             # Auto-reconnect: if candles haven't grown in 3 minutes, WS is dead
@@ -516,7 +522,7 @@ def main():
         if now.hour < 9 or (now.hour == 9 and now.minute < 30):
             continue
 
-        # After 3:10 PM — close all positions
+        # After 3:10 PM — close all positions (S1 and S3)
         if now.hour >= 15 and now.minute > 10:
             for tid in list(portfolio.positions.keys()):
                 pos = portfolio.positions[tid]
@@ -524,6 +530,16 @@ def main():
                 df = candle_builder.get_df(tok) if tok else None
                 if df is not None and len(df) > 0:
                     portfolio.close_position(tid, df["close"].iloc[-1], pos["remaining"], "EOD_EXIT")
+
+            # Close S3 positions
+            s3_stock_data = {}
+            for sym, tok in token_map.items():
+                df = candle_builder.get_df(tok)
+                if df is not None:
+                    s3_stock_data[tok] = df
+            if s3_stock_data:
+                # Force exit by calling scan with a time past 14:30 (the hard exit triggers)
+                scan_15min_rsi(s3_stock_data, token_to_sym, portfolio, logger, now)
 
             # Auto-stop at 3:30 PM — market is closed
             if now.hour >= 15 and now.minute >= 30:
@@ -679,6 +695,18 @@ def main():
             trade_counter[0] += 1
             tid = f"PAPER-{trade_counter[0]:04d}"
             portfolio.open_position(tid, sym, curr_price, qty, stop_loss, current_rsi)
+
+        # ── Strategy 3: Multi-Timeframe RSI Mean Reversion ──
+        try:
+            s3_stock_data = {}
+            for sym, tok in token_map.items():
+                df = candle_builder.get_df(tok)
+                if df is not None:
+                    s3_stock_data[tok] = df
+            if s3_stock_data:
+                scan_15min_rsi(s3_stock_data, token_to_sym, portfolio, logger, now)
+        except Exception as e:
+            print(f"\n  [S3 ERROR] {e}")
 
     # ── Shutdown ──
     try:

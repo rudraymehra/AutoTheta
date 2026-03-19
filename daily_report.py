@@ -74,9 +74,15 @@ def generate_report(report_date=None):
             if stock not in lowest_rsi or rsi_val < lowest_rsi[stock]:
                 lowest_rsi[stock] = rsi_val
 
-    # ── Analyze trades ──
+    # ── Analyze trades — split by strategy ──
+    # S3 trades have "S3_" prefix in their Reason field
     buys = [t for t in trades if t.get("Action") == "BUY"]
     sells = [t for t in trades if t.get("Action") == "SELL"]
+
+    s1_buys = [t for t in buys if not (t.get("Reason", "").startswith("S3_"))]
+    s1_sells = [t for t in sells if not (t.get("Reason", "").startswith("S3_"))]
+    s3_buys = [t for t in buys if t.get("Reason", "").startswith("S3_")]
+    s3_sells = [t for t in sells if t.get("Reason", "").startswith("S3_")]
 
     total_pnl = 0
     winning_trades = 0
@@ -89,7 +95,24 @@ def generate_report(report_date=None):
         elif pnl < 0:
             losing_trades += 1
 
+    s3_pnl = 0
+    s3_wins = 0
+    s3_losses = 0
+    for s in s3_sells:
+        pnl = float(s.get("P&L", "0") or "0")
+        s3_pnl += pnl
+        if pnl > 0:
+            s3_wins += 1
+        elif pnl < 0:
+            s3_losses += 1
+
+    s1_pnl = total_pnl - s3_pnl
+
     pnl_pct = (total_pnl / CAPITAL) * 100
+
+    # S3 thought analysis
+    s3_thoughts = [t for t in thoughts if "S3_" in t.get("Signal", "") or "S3" in t.get("Reason", "")]
+    s3_setups = [t for t in thoughts if t.get("Signal") == "S3_SETUP+TRIGGER"]
 
     # ── Determine market mood ──
     below_vwap = filter_reasons.get("Below VWAP", 0)
@@ -137,9 +160,11 @@ def generate_report(report_date=None):
     lines.append(f"  {market_desc}")
     lines.append("")
 
-    # RSI Bounce Strategy
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Strategy 1: RSI Bounce
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     lines.append("  ┌────────────────────────────────────────────────────┐")
-    lines.append("  │  STRATEGY: RSI Oversold Bounce                     │")
+    lines.append("  │  STRATEGY 1: RSI Oversold Bounce                   │")
     lines.append("  └────────────────────────────────────────────────────┘")
     lines.append("")
 
@@ -179,31 +204,84 @@ def generate_report(report_date=None):
             lines.append(f"  Skipped {total_skipped} signals due to position limits or sector rules")
             lines.append("")
 
-    # Trades
-    if buys:
-        lines.append(f"  What the bot DID:")
-        lines.append(f"    • Entered {len(buys)} trade(s)")
-        for b in buys:
+    # S1 Trades
+    if s1_buys:
+        lines.append(f"  What S1 DID:")
+        lines.append(f"    • Entered {len(s1_buys)} trade(s)")
+        for b in s1_buys:
             lines.append(f"      BUY {b['Stock']} x{b['Qty']} @ Rs{b['Price']} (RSI={b.get('RSI','')})")
         lines.append("")
 
-    if sells:
-        lines.append(f"  How trades ended:")
-        for s in sells:
+    if s1_sells:
+        lines.append(f"  How S1 trades ended:")
+        for s in s1_sells:
             pnl = float(s.get("P&L", "0") or "0")
-            emoji = "WIN" if pnl > 0 else "LOSS"
-            lines.append(f"      [{emoji}] SELL {s['Stock']} x{s['Qty']} @ Rs{s['Price']} "
+            tag = "WIN" if pnl > 0 else "LOSS"
+            lines.append(f"      [{tag}] SELL {s['Stock']} x{s['Qty']} @ Rs{s['Price']} "
                          f"| {s.get('Reason','')} | Rs{pnl:+,.2f}")
         lines.append("")
 
-    if not buys and not sells:
-        lines.append(f"  Trades: NONE")
+    if not s1_buys and not s1_sells:
+        lines.append(f"  S1 Trades: NONE")
         lines.append(f"  The bot saw opportunities but the filters blocked them all.")
         lines.append(f"  This is the bot protecting your capital on a bad day.")
         lines.append(f"  No trade > Bad trade.")
         lines.append("")
 
-    # P&L
+    lines.append(f"  S1 P&L: Rs{s1_pnl:+,.2f}")
+    lines.append("")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Strategy 3: Multi-Timeframe RSI Mean Reversion
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    lines.append("  ┌────────────────────────────────────────────────────┐")
+    lines.append("  │  STRATEGY 3: RSI 15-min Mean Reversion             │")
+    lines.append("  └────────────────────────────────────────────────────┘")
+    lines.append("")
+    lines.append("  Triple-screen approach: daily trend + 15-min setup + 5-min trigger")
+    lines.append("  Looks for oversold pullbacks within an uptrend (long-only)")
+    lines.append("")
+
+    if not s3_buys and not s3_sells and not s3_setups:
+        lines.append("  No setups triggered on the 15-min chart today.")
+        lines.append("  This means either:")
+        lines.append("    • No stock's 15-min RSI(14) dropped below 30")
+        lines.append("    • Or setups appeared but the 5-min entry trigger never fired")
+        lines.append("  Patience — mean-reversion needs real pullbacks, not noise.")
+    else:
+        if s3_setups:
+            lines.append(f"  Setups detected: {len(s3_setups)}")
+            s3_stocks = set(t.get("Stock", "") for t in s3_setups)
+            lines.append(f"    Stocks: {', '.join(sorted(s3_stocks))}")
+            lines.append("")
+
+        if s3_buys:
+            lines.append(f"  S3 Entries: {len(s3_buys)} trade(s)")
+            for b in s3_buys:
+                window = b.get("Reason", "").replace("S3_", "")
+                lines.append(f"    BUY {b['Stock']} x{b['Qty']} @ Rs{b['Price']} "
+                             f"(RSI={b.get('RSI','')}) [{window}]")
+            lines.append("")
+
+        if s3_sells:
+            lines.append(f"  S3 Exits:")
+            for s in s3_sells:
+                pnl = float(s.get("P&L", "0") or "0")
+                tag = "WIN" if pnl > 0 else "LOSS"
+                reason = s.get("Reason", "").replace("S3_", "")
+                lines.append(f"    [{tag}] SELL {s['Stock']} x{s['Qty']} @ Rs{s['Price']} "
+                             f"| {reason} | Rs{pnl:+,.2f}")
+            lines.append("")
+
+    s3_pnl_pct = (s3_pnl / CAPITAL) * 100 if CAPITAL > 0 else 0
+    lines.append(f"  S3 P&L: Rs{s3_pnl:+,.2f} ({s3_pnl_pct:+.2f}%)")
+    if s3_sells:
+        s3_wr = s3_wins / len(s3_sells) * 100
+        lines.append(f"  S3 Win Rate: {s3_wins}/{len(s3_sells)} ({s3_wr:.0f}%)")
+    lines.append("")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Combined P&L
     lines.append("  " + "-" * 56)
     lines.append(f"  DAILY P&L:          Rs{total_pnl:+,.2f} ({pnl_pct:+.2f}%)")
     if sells:
@@ -241,11 +319,12 @@ def generate_report(report_date=None):
     tomorrow_weekday = (weekday + 1) % 7
     if tomorrow_weekday == 2:  # Tuesday
         lines.append("  Tomorrow is TUESDAY — Nifty expiry day!")
-        lines.append("  Both RSI Bounce AND Expiry Skew strategies will be active.")
+        lines.append("  All three strategies will be active: RSI Bounce, Expiry Skew,")
+        lines.append("  and RSI 15-min Mean Reversion.")
     elif tomorrow_weekday in (0, 6):  # Weekend
         lines.append("  Tomorrow is weekend — market closed. Rest up.")
     else:
-        lines.append("  RSI Bounce will run again tomorrow.")
+        lines.append("  RSI Bounce + RSI 15-min Mean Reversion will run tomorrow.")
         lines.append("  Bot starts automatically at 9:10 AM.")
 
     if market_mood == "BEARISH":
