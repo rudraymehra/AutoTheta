@@ -690,6 +690,14 @@ def main():
     portfolio.summary()
     logger.close()
 
+    # Generate daily diary report
+    try:
+        from daily_report import generate_report
+        print("\n  Generating daily diary...")
+        generate_report()
+    except Exception as e:
+        print(f"  Report generation failed: {e}")
+
 
 if __name__ == "__main__":
     main()
