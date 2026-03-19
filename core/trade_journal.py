@@ -98,7 +98,7 @@ class TradeJournal:
                     exit_reason: str, fees: float = 0.0) -> float:
         """Record a partial or full exit. Returns realized P&L for this exit."""
         row = self.conn.execute(
-            "SELECT entry_price, quantity, side, status FROM trades WHERE trade_id=?",
+            "SELECT entry_price, quantity, side, status, symbol FROM trades WHERE trade_id=?",
             (trade_id,),
         ).fetchone()
         if not row:

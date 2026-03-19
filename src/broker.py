@@ -75,7 +75,7 @@ class LiveBroker(BaseBroker):
         order = {
             "variety": variety,
             "tradingsymbol": symbol,
-            "symboltoken": token,
+            "symboltoken": str(token),
             "transactiontype": txn_type,
             "exchange": "NFO",
             "ordertype": "LIMIT",  # MARKET is PROHIBITED for algo trading
@@ -112,7 +112,7 @@ class LiveBroker(BaseBroker):
         order = {
             "variety": "STOPLOSS",
             "tradingsymbol": symbol,
-            "symboltoken": token,
+            "symboltoken": str(token),
             "transactiontype": "BUY",
             "exchange": "NFO",
             "ordertype": "STOPLOSS_MARKET",

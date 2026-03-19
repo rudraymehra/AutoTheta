@@ -20,7 +20,6 @@ Exit rules:
   - Hard exit at 14:30
 """
 
-from collections import defaultdict
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -218,6 +217,8 @@ def check_daily_trend(token: str, df_1min: pd.DataFrame) -> bool:
             ema50 = _ema(df_1min["close"], 50).iloc[-1]
             price = df_1min["close"].iloc[-1]
             rsi_val = _rsi(df_1min["close"], 14).iloc[-1]
+            if pd.isna(ema50) or pd.isna(rsi_val):
+                return False
             ok = price > ema50 and rsi_val > 50
             if ok:
                 _daily_trend_ok[token] = True
@@ -228,6 +229,8 @@ def check_daily_trend(token: str, df_1min: pd.DataFrame) -> bool:
     rsi_val = _rsi(df_1min["close"], 14).iloc[-1]
     price = df_1min["close"].iloc[-1]
 
+    if pd.isna(ema200) or pd.isna(rsi_val):
+        return False
     ok = price > ema200 and rsi_val > 50
     if ok:
         _daily_trend_ok[token] = True
@@ -353,6 +356,18 @@ def _check_exits(stock_data: dict, token_to_sym: dict, portfolio, logger, now: d
         # Get 1-min data
         df_1 = stock_data.get(token)
         if df_1 is None or len(df_1) < 5:
+            # No data — still check time-stop and hard exit using last known price
+            current_price = pos["entry_price"]
+
+            # Hard exit at 14:30
+            if now.hour > 14 or (now.hour == 14 and now.minute >= 30):
+                _close_position(tid, current_price, "HARD_EXIT_1430", portfolio, logger)
+                continue
+
+            # Time stop — 50 minutes since entry
+            elapsed = (now - pos["entry_time"]).total_seconds() / 60
+            if elapsed >= cfg["time_stop_minutes"]:
+                _close_position(tid, current_price, "TIME_STOP", portfolio, logger)
             continue
 
         current_price = df_1["close"].iloc[-1]
@@ -385,7 +400,7 @@ def _check_exits(stock_data: dict, token_to_sym: dict, portfolio, logger, now: d
         # VWAP touch exit: price crosses above VWAP
         vwap_series = _vwap(df_1)
         current_vwap = vwap_series.iloc[-1]
-        if current_vwap > 0 and pos.get("entered_below_vwap", False):
+        if not pd.isna(current_vwap) and current_vwap > 0 and pos.get("entered_below_vwap", False):
             if current_price >= current_vwap:
                 _close_position(tid, current_price, "VWAP_TOUCH", portfolio, logger)
                 continue
@@ -512,6 +527,8 @@ def scan_15min_rsi(stock_data: dict, token_to_sym: dict, portfolio, logger, now:
         # Check VWAP for exit tracking
         vwap_series = _vwap(df_1)
         current_vwap = vwap_series.iloc[-1] if len(vwap_series) > 0 else 0
+        if pd.isna(current_vwap):
+            current_vwap = 0
         entered_below_vwap = current_price < current_vwap if current_vwap > 0 else False
 
         # ── ENTRY ──

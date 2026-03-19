@@ -10,7 +10,7 @@ Enforces:
 """
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from collections import defaultdict
 
 import pytz
@@ -149,7 +149,7 @@ class GlobalRiskManager:
             max_losses = cfg.get("max_consecutive_losses", 3)
             cooldown_mins = cfg.get("cooldown_minutes", 30)
             if self._consecutive_losses[strategy_name] >= max_losses:
-                until = datetime.now(IST) + __import__("datetime").timedelta(minutes=cooldown_mins)
+                until = datetime.now(IST) + timedelta(minutes=cooldown_mins)
                 self._cooldown_until[strategy_name] = until
                 log.warning("%s: %d consecutive losses — cooldown until %s",
                             strategy_name, self._consecutive_losses[strategy_name],

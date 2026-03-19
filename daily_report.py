@@ -47,7 +47,7 @@ def generate_report(report_date=None):
     triggered_stocks = set()
     for t in thoughts:
         if t.get("Signal") == "RSI<20":
-            triggered_stocks.add(t["Stock"])
+            triggered_stocks.add(t.get("Stock", ""))
 
     # Filter breakdown
     filter_reasons = defaultdict(int)
@@ -209,7 +209,7 @@ def generate_report(report_date=None):
         lines.append(f"  What S1 DID:")
         lines.append(f"    • Entered {len(s1_buys)} trade(s)")
         for b in s1_buys:
-            lines.append(f"      BUY {b['Stock']} x{b['Qty']} @ Rs{b['Price']} (RSI={b.get('RSI','')})")
+            lines.append(f"      BUY {b.get('Stock', '')} x{b.get('Qty', '')} @ Rs{b.get('Price', '')} (RSI={b.get('RSI','')})")
         lines.append("")
 
     if s1_sells:
@@ -217,7 +217,7 @@ def generate_report(report_date=None):
         for s in s1_sells:
             pnl = float(s.get("P&L", "0") or "0")
             tag = "WIN" if pnl > 0 else "LOSS"
-            lines.append(f"      [{tag}] SELL {s['Stock']} x{s['Qty']} @ Rs{s['Price']} "
+            lines.append(f"      [{tag}] SELL {s.get('Stock', '')} x{s.get('Qty', '')} @ Rs{s.get('Price', '')} "
                          f"| {s.get('Reason','')} | Rs{pnl:+,.2f}")
         lines.append("")
 
@@ -259,7 +259,7 @@ def generate_report(report_date=None):
             lines.append(f"  S3 Entries: {len(s3_buys)} trade(s)")
             for b in s3_buys:
                 window = b.get("Reason", "").replace("S3_", "")
-                lines.append(f"    BUY {b['Stock']} x{b['Qty']} @ Rs{b['Price']} "
+                lines.append(f"    BUY {b.get('Stock', '')} x{b.get('Qty', '')} @ Rs{b.get('Price', '')} "
                              f"(RSI={b.get('RSI','')}) [{window}]")
             lines.append("")
 
@@ -269,7 +269,7 @@ def generate_report(report_date=None):
                 pnl = float(s.get("P&L", "0") or "0")
                 tag = "WIN" if pnl > 0 else "LOSS"
                 reason = s.get("Reason", "").replace("S3_", "")
-                lines.append(f"    [{tag}] SELL {s['Stock']} x{s['Qty']} @ Rs{s['Price']} "
+                lines.append(f"    [{tag}] SELL {s.get('Stock', '')} x{s.get('Qty', '')} @ Rs{s.get('Price', '')} "
                              f"| {reason} | Rs{pnl:+,.2f}")
             lines.append("")
 

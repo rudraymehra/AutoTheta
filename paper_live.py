@@ -613,12 +613,22 @@ def main():
                 continue
 
             # ── RSI crossed below 20 — run filter stack ──
-            # Already holding?
+            # Already holding in S1?
             if any(p["symbol"] == sym for p in portfolio.positions.values()):
                 logger.log_thought(
                     sym, curr_price, current_rsi, "RSI<20",
                     ema20_5m, curr_vwap, curr_volume, vol_avg,
                     "SKIP", "Already holding this stock",
+                )
+                continue
+
+            # Already holding in S3?
+            s3_syms = {p["symbol"] for p in get_s3_positions().values()}
+            if sym in s3_syms:
+                logger.log_thought(
+                    sym, curr_price, current_rsi, "RSI<20",
+                    ema20_5m, curr_vwap, curr_volume, vol_avg,
+                    "SKIP", "Already holding in S3",
                 )
                 continue
 
