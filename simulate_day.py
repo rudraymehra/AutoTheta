@@ -1,11 +1,11 @@
 """Simulate a full trading day — replay 1-min candles as if it's live.
 
-Tests all strategies: S1 (RSI(4) Mean Reversion on 5-min), S3 (15-min Mean Reversion)
+Tests all strategies: S1 (RSI(5) Mean Reversion on 5-min), S3 (15-min Mean Reversion)
 Also checks S2 (Expiry Skew) conditions if it's a Tuesday.
 
-v2.0 — Research-backed parameters:
-  S1: RSI(4) on 5-min, hook above 15, VWAP below entry, 3x ATR stop, 75-min time stop
-  S3: RSI(9) setup<40 on 15-min, entry<25 on 5-min, ADX(14)<30, 3x ATR stop
+v2.1 — Filter stack redesign:
+  S1: RSI(5) on 5-min, uptick from <20, daily regime 2/3, KER<0.30, below VWAP, MFI(8)<30
+  S3: RSI(9) setup<40 on 15-min, entry<25 on 5-min, KER(10)<0.30, 3x ATR stop
 
 Usage: python simulate_day.py [YYYY-MM-DD]
 Default: today
@@ -29,7 +29,17 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env")
 
 # ── Indicators ──
-def rsi(series, period=4):
+def rsi(series, period=5):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
+    return 100 - (100 / (1 + rs))
+
+def rsi_calc(series, period=14):
+    """RSI with configurable period — used for daily regime check."""
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -69,8 +79,23 @@ def adx_calc(high, low, close, period=14):
     dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-10))
     return dx.ewm(alpha=1/period, min_periods=period).mean()
 
+def kaufman_er(series, period=10):
+    """Kaufman Efficiency Ratio. 0=pure chop, 1=perfect trend."""
+    direction = abs(series - series.shift(period))
+    volatility = series.diff().abs().rolling(period).sum()
+    return direction / volatility.replace(0, 1e-10)
 
-# v2.0 stock universe — dropped metals/energy, focus banking/IT/FMCG
+def mfi(high, low, close, volume, period=8):
+    """Money Flow Index — RSI with volume."""
+    tp = (high + low + close) / 3
+    mf = tp * volume
+    pos_mf = mf.where(tp > tp.shift(1), 0.0).rolling(period).sum()
+    neg_mf = mf.where(tp < tp.shift(1), 0.0).rolling(period).sum()
+    mr = pos_mf / neg_mf.replace(0, 1e-10)
+    return 100 - (100 / (1 + mr))
+
+
+# v2.1 stock universe — dropped metals/energy, focus banking/IT/FMCG
 SECTOR_MAP = {
     "HDFCBANK-EQ": "Banking", "ICICIBANK-EQ": "Banking", "KOTAKBANK-EQ": "Banking",
     "SBIN-EQ": "Banking", "AXISBANK-EQ": "Banking",
@@ -135,6 +160,49 @@ class SimPortfolio:
         return {k: v for k, v in self.positions.items() if v["strategy"] == strategy}
 
 
+def fetch_daily_regime(api, token_map, target_date):
+    """Fetch daily candles and compute 2-of-3 regime check for each stock."""
+    daily_regime = {}
+    print(f"  Running daily regime check...")
+    for sym, tok in token_map.items():
+        time.sleep(0.5)
+        try:
+            r = api.getCandleData({
+                "exchange": "NSE", "symboltoken": tok, "interval": "ONE_DAY",
+                "fromdate": "2025-06-01 09:15",
+                "todate": f"{target_date} 15:30",
+            })
+            if r and r.get("data") and len(r["data"]) > 50:
+                ddf = pd.DataFrame(r["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+                ddf["close"] = pd.to_numeric(ddf["close"], errors="coerce")
+                ddf["high"] = pd.to_numeric(ddf["high"], errors="coerce")
+                ddf["low"] = pd.to_numeric(ddf["low"], errors="coerce")
+                ddf["ema200"] = ema(ddf["close"], 200)
+                ddf["rsi14"] = rsi_calc(ddf["close"], 14)
+                ddf["adx14"] = adx_calc(ddf["high"], ddf["low"], ddf["close"], 14)
+                last = ddf.iloc[-1]
+
+                checks_passed = 0
+                if pd.notna(last["ema200"]):
+                    if abs(last["close"] - last["ema200"]) / last["ema200"] < 0.08:
+                        checks_passed += 1
+                if pd.notna(last["rsi14"]):
+                    if 30 <= last["rsi14"] <= 65:
+                        checks_passed += 1
+                if pd.notna(last["adx14"]):
+                    if last["adx14"] < 25:
+                        checks_passed += 1
+
+                daily_regime[sym] = checks_passed >= 2
+                status = "PASS" if daily_regime[sym] else "FAIL"
+                print(f"    {sym:18s} regime={status} ({checks_passed}/3)")
+            else:
+                daily_regime[sym] = True
+        except Exception:
+            daily_regime[sym] = True
+    return daily_regime
+
+
 def fetch_data(target_date):
     """Fetch 1-min candles for all stocks."""
     api = SmartConnect(os.getenv("ANGEL_API_KEY"))
@@ -151,6 +219,9 @@ def fetch_data(target_date):
         m = mdf[(mdf["symbol"] == sym) & (mdf["exch_seg"] == "NSE")]
         if not m.empty:
             token_map[sym] = m.iloc[0]["token"]
+
+    # Fetch daily regime data
+    daily_regime = fetch_daily_regime(api, token_map, target_date)
 
     print(f"  Fetching {len(token_map)} stocks for {target_date}...")
     data = {}
@@ -170,40 +241,52 @@ def fetch_data(target_date):
                 print(f"    {sym:18s} No data")
         except Exception as e:
             print(f"    {sym:18s} Error: {e}")
-    return data
+    return data, daily_regime
 
 
-def simulate(data, target_date):
+def simulate(data, target_date, daily_regime=None):
     """Replay candles minute by minute, running all strategies."""
     portfolio = SimPortfolio()
+    if daily_regime is None:
+        daily_regime = {sym: True for sym in data}
 
     print(f"\n{'='*70}")
-    print(f"  FULL DAY SIMULATION v2.0 — {target_date}")
-    print(f"  Strategies: S1 (RSI(4) 5-min Mean Reversion) + S3 (15-min Mean Reversion)")
+    print(f"  FULL DAY SIMULATION v2.1 — {target_date}")
+    print(f"  Strategies: S1 (RSI(5) 5-min Mean Reversion) + S3 (15-min Mean Reversion)")
     is_tuesday = datetime.strptime(str(target_date), "%Y-%m-%d").weekday() == 1
     if is_tuesday:
         print(f"  Tuesday = Expiry Day — S2 (Expiry Skew) also checked")
     print(f"  Capital: Rs{CAPITAL:,}")
+    regime_pass = sum(1 for v in daily_regime.values() if v)
+    print(f"  Daily regime: {regime_pass}/{len(daily_regime)} stocks passed")
     print(f"{'='*70}\n")
 
     # Precompute all indicators for each stock
     for sym, df in data.items():
         df["atr14"] = atr_calc(df["high"], df["low"], df["close"], 14)
-        df["ema200"] = ema(df["close"], 200)
         df["vwap"] = vwap_calc(df)
 
-        # 5-min resampled for S1: RSI(4) on 5-min
+        # 5-min resampled for S1: RSI(5) on 5-min
         df_5m = df.set_index("timestamp").resample("5min").agg({
             "open": "first", "high": "max", "low": "min",
             "close": "last", "volume": "sum",
         }).dropna().reset_index()
-        if len(df_5m) >= 5:
-            df_5m["rsi4"] = rsi(df_5m["close"], 4)
-            df["rsi4_5m"] = None
+        if len(df_5m) >= 6:
+            df_5m["rsi5"] = rsi(df_5m["close"], 5)
+            df["rsi5_5m"] = None
             for _, bar in df_5m.iterrows():
                 mask = (df["timestamp"] >= bar["timestamp"]) & (df["timestamp"] < bar["timestamp"] + pd.Timedelta(minutes=5))
-                df.loc[mask, "rsi4_5m"] = bar.get("rsi4")
-            df["rsi4_5m"] = df["rsi4_5m"].ffill()
+                df.loc[mask, "rsi5_5m"] = bar.get("rsi5")
+            df["rsi5_5m"] = df["rsi5_5m"].ffill()
+
+            # MFI(8) on 5-min
+            if len(df_5m) >= 10:
+                df_5m["mfi8"] = mfi(df_5m["high"], df_5m["low"], df_5m["close"], df_5m["volume"], 8)
+                df["mfi8_5m"] = None
+                for _, bar in df_5m.iterrows():
+                    mask = (df["timestamp"] >= bar["timestamp"]) & (df["timestamp"] < bar["timestamp"] + pd.Timedelta(minutes=5))
+                    df.loc[mask, "mfi8_5m"] = bar.get("mfi8")
+                df["mfi8_5m"] = df["mfi8_5m"].ffill()
 
         # 15-min resampled for filters
         df_15m = df.set_index("timestamp").resample("15min").agg({
@@ -211,12 +294,12 @@ def simulate(data, target_date):
             "close": "last", "volume": "sum",
         }).dropna().reset_index()
         if len(df_15m) >= 5:
-            df_15m["adx14"] = adx_calc(df_15m["high"], df_15m["low"], df_15m["close"], 14)
+            df_15m["ker10"] = kaufman_er(df_15m["close"], 10)
             df_15m["atr14"] = atr_calc(df_15m["high"], df_15m["low"], df_15m["close"], 14)
             df_15m["rsi9"] = rsi(df_15m["close"], 9)
 
             # Map 15-min indicators back
-            for col in ["adx14", "atr14", "rsi9"]:
+            for col in ["ker10", "atr14", "rsi9"]:
                 df[f"{col}_15m"] = None
                 for _, bar in df_15m.iterrows():
                     mask = (df["timestamp"] >= bar["timestamp"]) & (df["timestamp"] < bar["timestamp"] + pd.Timedelta(minutes=15))
@@ -273,7 +356,7 @@ def simulate(data, target_date):
             pos["candles_held"] += 1
 
             if pos["strategy"] == "S1":
-                curr_rsi4 = row.get("rsi4_5m")
+                curr_rsi5 = row.get("rsi5_5m")
 
                 # Disaster stop: 3x ATR on 15-min
                 if row["close"] <= pos["stop_loss"]:
@@ -299,9 +382,9 @@ def simulate(data, target_date):
                         pos["vwap_exit_done"] = True
                         continue
 
-                # Exit 2: remaining 40% at RSI(4) > 50
-                if not pd.isna(curr_rsi4) and curr_rsi4 >= 50:
-                    portfolio.close(tid, row["close"], pos["remaining"], "RSI4_GT50", ts_str)
+                # Exit 2: remaining 40% at RSI(5) > 50
+                if not pd.isna(curr_rsi5) and curr_rsi5 >= 50:
+                    portfolio.close(tid, row["close"], pos["remaining"], "RSI5_GT50", ts_str)
 
             elif pos["strategy"] == "S3":
                 rsi9_5 = row.get("rsi9_5m")
@@ -326,7 +409,7 @@ def simulate(data, target_date):
                 if row["close"] >= row["vwap"] and pos.get("entered_below_vwap"):
                     portfolio.close(tid, row["close"], pos["remaining"], "S3_VWAP_TOUCH", ts_str)
 
-        # ── S1: RSI(4) on 5-min — entries only 10:15-14:00 ──
+        # ── S1: RSI(5) on 5-min — entries only 10:15-14:00 ──
         now_min = hour * 60 + minute
         s1_entry_ok = (10 * 60 + 15) <= now_min < (14 * 60)
 
@@ -337,16 +420,16 @@ def simulate(data, target_date):
                 row = df.iloc[i]
                 prev = df.iloc[i - 1]
 
-                curr_rsi4 = row.get("rsi4_5m")
-                prev_rsi4 = prev.get("rsi4_5m")
+                curr_rsi5 = row.get("rsi5_5m")
+                prev_rsi5 = prev.get("rsi5_5m")
 
-                if curr_rsi4 is None or prev_rsi4 is None:
+                if curr_rsi5 is None or prev_rsi5 is None:
                     continue
-                if pd.isna(curr_rsi4) or pd.isna(prev_rsi4):
+                if pd.isna(curr_rsi5) or pd.isna(prev_rsi5):
                     continue
 
-                # RSI(4) hook: prev < 15 AND current >= 15
-                if not (prev_rsi4 < 15 and curr_rsi4 >= 15):
+                # RSI(5) uptick: prev < 20 AND curr > prev (rising from oversold)
+                if not (prev_rsi5 < 20 and curr_rsi5 > prev_rsi5):
                     continue
 
                 s1_signals += 1
@@ -359,21 +442,25 @@ def simulate(data, target_date):
                 if portfolio.sector_count.get(sector, 0) >= 1:
                     continue
 
-                # Filter 1: EMA(200) proxy — price above 1-min EMA(200)
-                ema200 = row.get("ema200")
-                if pd.notna(ema200) and row["close"] < ema200:
+                # Filter 1: Daily regime check (2 of 3 conditions)
+                if not daily_regime.get(sym, True):
                     s1_filtered += 1
                     continue
 
-                # Filter 2: 15-min ADX(14) < 25 (range-bound)
-                adx14_15 = row.get("adx14_15m")
-                if pd.notna(adx14_15) and adx14_15 >= 25:
+                # Filter 2: KER(10) < 0.30 on 15-min (choppy/mean-reverting)
+                ker_15 = row.get("ker10_15m")
+                if pd.notna(ker_15) and ker_15 >= 0.30:
                     s1_filtered += 1
                     continue
 
-                # Filter 3: VWAP positioning — 0.3% to 1.2% below VWAP
-                vwap_distance = (row["close"] - row["vwap"]) / row["vwap"] if row["vwap"] > 0 else 0
-                if not (-0.012 <= vwap_distance <= -0.003):
+                # Filter 3: Price must be below VWAP
+                if row["vwap"] > 0 and row["close"] >= row["vwap"]:
+                    s1_filtered += 1
+                    continue
+
+                # Filter 4: MFI(8) < 30 confirmation (optional)
+                mfi_val = row.get("mfi8_5m")
+                if pd.notna(mfi_val) and mfi_val >= 30:
                     s1_filtered += 1
                     continue
 
@@ -388,8 +475,9 @@ def simulate(data, target_date):
                 if qty <= 0:
                     continue
 
+                vwap_distance = (row["close"] - row["vwap"]) / row["vwap"] if row["vwap"] > 0 else 0
                 portfolio.open("S1", sym, row["close"], qty, stop_loss,
-                              f"RSI(4)={curr_rsi4:.1f} VWAP_dist={vwap_distance*100:.2f}%", ts_str)
+                              f"RSI(5)={curr_rsi5:.1f} VWAP_dist={vwap_distance*100:.2f}%", ts_str)
 
         # ── S3: 15-min Mean Reversion entries ──
         # Only in prime window (10:15-12:00) and secondary (1:30-2:30)
@@ -403,20 +491,20 @@ def simulate(data, target_date):
                 row = df.iloc[i]
 
                 rsi9_15 = row.get("rsi9_15m")
-                adx14_15 = row.get("adx14_15m")
+                ker_15 = row.get("ker10_15m")
                 rsi9_5 = row.get("rsi9_5m")
                 atr14_15 = row.get("atr14_15m")
 
                 # Need all indicators
-                if any(v is None or (isinstance(v, float) and pd.isna(v)) for v in [rsi9_15, adx14_15, rsi9_5]):
+                if any(v is None or (isinstance(v, float) and pd.isna(v)) for v in [rsi9_15, rsi9_5]):
                     continue
-                if rsi9_15 is None or adx14_15 is None or rsi9_5 is None:
+                if rsi9_15 is None or rsi9_5 is None:
                     continue
 
-                # Screen 2: 15-min setup — RSI(9) < 40, ADX(14) < 30
+                # Screen 2: 15-min setup — RSI(9) < 40, KER(10) < 0.30
                 if rsi9_15 >= 40:
                     continue
-                if adx14_15 >= 30:
+                if pd.notna(ker_15) and ker_15 >= 0.30:
                     continue
 
                 s3_setups += 1
@@ -455,8 +543,9 @@ def simulate(data, target_date):
 
                 s3_entries += 1
                 window = "PRIME" if in_prime else "SECONDARY"
+                ker_str = f"{ker_15:.3f}" if pd.notna(ker_15) else "N/A"
                 tid = portfolio.open("S3", sym, row["close"], qty, stop_loss,
-                              f"15mRSI(9)={rsi9_15:.1f} 5mRSI(9)={rsi9_5:.1f} ADX(14)={adx14_15:.1f} [{window}]",
+                              f"15mRSI(9)={rsi9_15:.1f} 5mRSI(9)={rsi9_5:.1f} KER(10)={ker_str} [{window}]",
                               ts_str)
                 # Track VWAP entry for exit logic
                 if tid and tid in portfolio.positions:
@@ -466,14 +555,14 @@ def simulate(data, target_date):
     pnl_pct = (portfolio.daily_pnl / CAPITAL) * 100
 
     print(f"\n{'='*70}")
-    print(f"  SIMULATION RESULTS v2.0 — {target_date}")
+    print(f"  SIMULATION RESULTS v2.1 — {target_date}")
     print(f"{'='*70}")
 
     # S1 summary
     s1_trades = [t for t in portfolio.closed if t["strategy"] == "S1"]
     s1_pnl = sum(t["realized_pnl"] for t in s1_trades)
     s1_wins = len([t for t in s1_trades if t["realized_pnl"] > 0])
-    print(f"\n  S1: RSI(4) 5-min Mean Reversion")
+    print(f"\n  S1: RSI(5) 5-min Mean Reversion")
     print(f"    Signals: {s1_signals} | Filtered: {s1_filtered} | Traded: {len(s1_trades)}")
     if s1_trades:
         print(f"    Win/Loss: {s1_wins}/{len(s1_trades)-s1_wins} ({s1_wins/len(s1_trades)*100:.0f}%)")
@@ -489,7 +578,7 @@ def simulate(data, target_date):
     s3_trades = [t for t in portfolio.closed if t["strategy"] == "S3"]
     s3_pnl = sum(t["realized_pnl"] for t in s3_trades)
     s3_wins = len([t for t in s3_trades if t["realized_pnl"] > 0])
-    print(f"\n  S3: 15-min Mean Reversion (RSI(9)<40, ADX(14)<30)")
+    print(f"\n  S3: 15-min Mean Reversion (RSI(9)<40, KER(10)<0.30)")
     print(f"    Setups: {s3_setups} | Entries: {s3_entries} | Traded: {len(s3_trades)}")
     if s3_trades:
         print(f"    Win/Loss: {s3_wins}/{len(s3_trades)-s3_wins} ({s3_wins/len(s3_trades)*100:.0f}%)")
@@ -515,22 +604,27 @@ def simulate(data, target_date):
 if __name__ == "__main__":
     target = sys.argv[1] if len(sys.argv) > 1 else date.today().isoformat()
     print(f"{'='*70}")
-    print(f"  AutoTheta Day Simulator v2.0")
+    print(f"  AutoTheta Day Simulator v2.1")
     print(f"{'='*70}")
 
     # Check for cached data
-    cache = Path(f"/tmp/march{target[-2:]}_data.pkl")
+    cache = Path(f"/tmp/march{target[-2:]}_data_v21.pkl")
     if cache.exists():
         print(f"  Loading cached data from {cache}")
         with open(cache, "rb") as f:
-            data = pickle.load(f)
+            cached = pickle.load(f)
+        if isinstance(cached, tuple):
+            data, daily_regime = cached
+        else:
+            data = cached
+            daily_regime = {sym: True for sym in data}
     else:
-        data = fetch_data(target)
+        data, daily_regime = fetch_data(target)
         with open(cache, "wb") as f:
-            pickle.dump(data, f)
+            pickle.dump((data, daily_regime), f)
 
     if not data:
         print("  No data available!")
         sys.exit(1)
 
-    simulate(data, target)
+    simulate(data, target, daily_regime)

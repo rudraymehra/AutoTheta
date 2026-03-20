@@ -1,9 +1,10 @@
 """Strategy 3: Multi-Timeframe RSI Mean Reversion (15-min setup + 5-min entry).
 
-v2.0 — Research-backed parameter updates:
-  Screen 1 — Daily trend filter: stock above 200-EMA proxy
-  Screen 2 — 15-min setup: RSI(9) < 40, ADX(14) < 30
+v2.1 — Filter stack redesign:
+  Screen 1 — Daily 2-of-3 regime check (EMA proximity, RSI range, ADX)
+  Screen 2 — 15-min setup: RSI(9) < 40, KER(10) < 0.30
   Screen 3 — 5-min entry trigger: RSI(9) crosses back above 25, price below VWAP
+  Optional — MFI(8) < 30 volume confirmation
 
 LONG-ONLY — never short (India's structural bullish bias).
 
@@ -79,6 +80,35 @@ def _adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) ->
     return adx_val
 
 
+def _kaufman_er(series: pd.Series, period: int = 10) -> pd.Series:
+    """Kaufman Efficiency Ratio. 0=pure chop, 1=perfect trend."""
+    direction = abs(series - series.shift(period))
+    volatility = series.diff().abs().rolling(period).sum()
+    return direction / volatility.replace(0, 1e-10)
+
+
+def _mfi(high: pd.Series, low: pd.Series, close: pd.Series,
+         volume: pd.Series, period: int = 8) -> pd.Series:
+    """Money Flow Index — RSI with volume."""
+    tp = (high + low + close) / 3
+    mf = tp * volume
+    pos_mf = mf.where(tp > tp.shift(1), 0.0).rolling(period).sum()
+    neg_mf = mf.where(tp < tp.shift(1), 0.0).rolling(period).sum()
+    mr = pos_mf / neg_mf.replace(0, 1e-10)
+    return 100 - (100 / (1 + mr))
+
+
+def _rsi_daily(series: pd.Series, period: int = 14) -> pd.Series:
+    """RSI with configurable period — used for daily regime check."""
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
+    return 100 - (100 / (1 + rs))
+
+
 # ── Resampler ───────────────────────────────────────────
 
 def _resample(df_1min: pd.DataFrame, freq: str) -> pd.DataFrame:
@@ -102,18 +132,20 @@ def _resample(df_1min: pd.DataFrame, freq: str) -> pd.DataFrame:
     return resampled.reset_index()
 
 
-# ── Configuration defaults (v2.0 research-backed) ──────
+# ── Configuration defaults (v2.1 filter stack redesign) ──
 
 _DEFAULTS = dict(
-    setup_rsi_period=9,            # RSI(9) on 15-min (was 14)
-    setup_rsi_threshold=40,        # Connie Brown: oversold in bull = 40-50 (was 30)
+    setup_rsi_period=9,            # RSI(9) on 15-min (Connie Brown)
+    setup_rsi_threshold=40,        # Connie Brown: oversold in bull = 40-50
     entry_rsi_period=9,
-    entry_rsi_threshold=25,        # 5-min trigger (was 30)
-    exit_rsi_threshold=50,         # Exit sooner at RSI>50 (was 55)
-    adx_period=14,                 # ADX(14) (was 10)
-    adx_max=30,                    # Less restrictive (was 25)
-    atr_sl_mult=3.0,              # Disaster stop only (was 1.5)
-    time_stop_minutes=75,          # Wider time window (was 50)
+    entry_rsi_threshold=25,        # 5-min trigger
+    exit_rsi_threshold=50,         # Exit at RSI>50
+    ker_period=10,                 # Kaufman Efficiency Ratio period
+    ker_max=0.30,                  # Only trade when KER < 0.30 (choppy)
+    mfi_period=8,                  # Money Flow Index period
+    mfi_threshold=30,              # MFI < 30 confirmation
+    atr_sl_mult=3.0,              # Disaster stop only
+    time_stop_minutes=75,          # 75-min time window
     max_positions=3,
     max_per_sector=1,
     prime_window_start="10:15",
@@ -151,6 +183,7 @@ def reset_state():
     """Call at the start of each day to clear state."""
     _setups.clear()
     _positions.clear()
+    _daily_regime_ok.clear()
     _trade_counter[0] = 0
     _daily_pnl[0] = 0.0
     _daily_trades_count[0] = 0
@@ -181,41 +214,69 @@ def _in_window(now: datetime, start_str: str, end_str: str) -> bool:
     return start_min <= now_min < end_min
 
 
-# ── Daily trend filter (Screen 1) ──────────────────────
+# ── Daily regime filter (Screen 1) — 2-of-3 check ──────
 
-_daily_trend_ok: dict[str, bool] = {}   # token -> True if daily trend is bullish
+_daily_regime_ok: dict[str, bool] = {}   # token -> True if daily regime allows trading
+
+
+def set_daily_regime(regime_map: dict) -> None:
+    """Set daily regime from external source (e.g. paper_live.py startup).
+
+    regime_map: {token_or_symbol: True/False}
+    """
+    _daily_regime_ok.update(regime_map)
 
 
 def check_daily_trend(token: str, df_1min: pd.DataFrame) -> bool:
-    """Approximate daily trend check using available 1-min data.
+    """Daily regime check using 2-of-3 conditions.
 
-    Uses EMA(200) on 1-min as a rough proxy for the daily 200-EMA.
-    Once a stock passes this check, it's cached for the day.
+    If regime was pre-computed (via set_daily_regime), use cached value.
+    Otherwise, approximate using available 1-min data:
+      - EMA proximity (within 8% of EMA(200))
+      - RSI(14) between 30-65 (Connie Brown bear range)
+      - Intraday ADX(14) < 25
+
+    Once a stock passes, it's cached for the day.
     """
-    if token in _daily_trend_ok:
-        return _daily_trend_ok[token]
+    if token in _daily_regime_ok:
+        return _daily_regime_ok[token]
 
     if df_1min is None or len(df_1min) < 200:
-        # Not enough data yet — give benefit of doubt if we have enough for EMA
+        # Not enough data — use simpler fallback
         if df_1min is not None and len(df_1min) >= 50:
             ema50 = _ema(df_1min["close"], 50).iloc[-1]
             price = df_1min["close"].iloc[-1]
             if pd.isna(ema50):
                 return False
-            ok = price > ema50
+            ok = abs(price - ema50) / ema50 < 0.08
             if ok:
-                _daily_trend_ok[token] = True
+                _daily_regime_ok[token] = True
             return ok
         return False
 
+    checks_passed = 0
+
+    # Check 1: within 8% of EMA(200)
     ema200 = _ema(df_1min["close"], 200).iloc[-1]
     price = df_1min["close"].iloc[-1]
+    if pd.notna(ema200) and ema200 > 0:
+        if abs(price - ema200) / ema200 < 0.08:
+            checks_passed += 1
 
-    if pd.isna(ema200):
-        return False
-    ok = price > ema200
-    if ok:
-        _daily_trend_ok[token] = True
+    # Check 2: RSI(14) between 30 and 65
+    rsi14 = _rsi_daily(df_1min["close"], 14).iloc[-1]
+    if pd.notna(rsi14):
+        if 30 <= rsi14 <= 65:
+            checks_passed += 1
+
+    # Check 3: ADX(14) < 25 (using 1-min as proxy)
+    adx14 = _adx(df_1min["high"], df_1min["low"], df_1min["close"], 14).iloc[-1]
+    if pd.notna(adx14):
+        if adx14 < 25:
+            checks_passed += 1
+
+    ok = checks_passed >= 2
+    _daily_regime_ok[token] = ok
     return ok
 
 
@@ -224,14 +285,14 @@ def check_daily_trend(token: str, df_1min: pd.DataFrame) -> bool:
 def _check_15min_setup(token: str, sym: str, df_15: pd.DataFrame, cfg: dict) -> bool:
     """Check if a stock has a mean-reversion setup on the 15-min chart.
 
-    v2.0 Conditions:
+    v2.1 Conditions:
       - RSI(9) < 40 (Connie Brown: bull market oversold = 40-50)
-      - ADX(14) < 30 (range-bound, less restrictive)
-      - Price below VWAP (flipped — mean reversion buys below the mean)
+      - KER(10) < 0.30 (choppy/mean-reverting, not trending)
+      - Price below VWAP (mean reversion buys below the mean)
 
     If satisfied, records the setup with ATR for stop-loss calculation.
     """
-    if df_15 is None or len(df_15) < max(cfg["adx_period"], cfg["setup_rsi_period"]) + 2:
+    if df_15 is None or len(df_15) < max(cfg["ker_period"], cfg["setup_rsi_period"]) + 2:
         return False
 
     rsi_15 = _rsi(df_15["close"], cfg["setup_rsi_period"])
@@ -243,9 +304,9 @@ def _check_15min_setup(token: str, sym: str, df_15: pd.DataFrame, cfg: dict) -> 
             del _setups[token]
         return False
 
-    adx_val = _adx(df_15["high"], df_15["low"], df_15["close"], cfg["adx_period"])
-    current_adx = adx_val.iloc[-1]
-    if pd.isna(current_adx) or current_adx >= cfg["adx_max"]:
+    ker_val = _kaufman_er(df_15["close"], cfg["ker_period"])
+    current_ker = ker_val.iloc[-1]
+    if pd.isna(current_ker) or current_ker >= cfg["ker_max"]:
         return False
 
     # Calculate 15-min ATR for stop-loss
@@ -259,7 +320,7 @@ def _check_15min_setup(token: str, sym: str, df_15: pd.DataFrame, cfg: dict) -> 
     _setups[token] = {
         "symbol": sym,
         "rsi_15": current_rsi_15,
-        "adx": current_adx,
+        "ker": current_ker,
         "atr_15": current_atr_15,
         "setup_time": datetime.now(),
         "price_at_setup": current_price,
@@ -272,11 +333,11 @@ def _check_15min_setup(token: str, sym: str, df_15: pd.DataFrame, cfg: dict) -> 
 def _check_5min_trigger(token: str, df_5: pd.DataFrame, df_1: pd.DataFrame, cfg: dict) -> bool:
     """Check if the 5-min chart shows a valid entry trigger.
 
-    v2.0 Conditions:
+    v2.1 Conditions:
       - RSI(9) crosses back above 25 (bounce confirmation)
-      - Price BELOW VWAP (flipped — entry below the mean, VWAP = exit target)
+      - Price BELOW VWAP (entry below the mean, VWAP = exit target)
       - Bullish candle (close > open)
-    Removed: volume spike filter, Bollinger Band, VWAP proximity
+      - MFI(8) < 30 volume confirmation (optional — skip if unavailable)
     """
     if df_5 is None or len(df_5) < cfg["entry_rsi_period"] + 2:
         return False
@@ -307,6 +368,13 @@ def _check_5min_trigger(token: str, df_5: pd.DataFrame, df_1: pd.DataFrame, cfg:
         if current_vwap > 0:
             if last_5m["close"] >= current_vwap:
                 return False  # Above VWAP — not a mean reversion entry
+
+    # MFI(8) < 30 confirmation (optional — skip if not enough data)
+    if len(df_5) >= cfg["mfi_period"] + 2:
+        mfi_val = _mfi(df_5["high"], df_5["low"], df_5["close"], df_5["volume"], cfg["mfi_period"])
+        current_mfi = mfi_val.iloc[-1]
+        if pd.notna(current_mfi) and current_mfi >= cfg["mfi_threshold"]:
+            return False  # Volume not confirming oversold
 
     return True
 
@@ -511,7 +579,7 @@ def scan_15min_rsi(stock_data: dict, token_to_sym: dict, portfolio, logger, now:
             "stop_loss": stop_loss,
             "entry_time": now,
             "entry_rsi_15": setup["rsi_15"],
-            "entry_adx": setup["adx"],
+            "entry_ker": setup["ker"],
             "entered_below_vwap": entered_below_vwap,
             "window": window_tag,
         }
@@ -520,8 +588,8 @@ def scan_15min_rsi(stock_data: dict, token_to_sym: dict, portfolio, logger, now:
         # Log thought
         logger.log_thought(
             sym, current_price, setup["rsi_15"], "S3_SETUP+TRIGGER",
-            None, current_vwap, None, setup["adx"],
-            "BUY", (f"S3 MeanRevert | 15m RSI(9)={setup['rsi_15']:.1f} ADX(14)={setup['adx']:.1f} | "
+            True, current_vwap, None, setup["ker"],
+            "BUY", (f"S3 MeanRevert | 15m RSI(9)={setup['rsi_15']:.1f} KER(10)={setup['ker']:.3f} | "
                     f"Qty={qty} SL={stop_loss:.2f} | {window_tag}"),
         )
 
@@ -535,7 +603,7 @@ def scan_15min_rsi(stock_data: dict, token_to_sym: dict, portfolio, logger, now:
 
         print(f"\n  >> S3 BUY {sym} x{qty} @ Rs{current_price:.2f} | "
               f"SL=Rs{stop_loss:.2f} | 15m RSI(9)={setup['rsi_15']:.1f} | "
-              f"ADX(14)={setup['adx']:.1f} | {window_tag}")
+              f"KER(10)={setup['ker']:.3f} | {window_tag}")
 
         # Consume the setup — don't re-enter on the same signal
         del _setups[token]

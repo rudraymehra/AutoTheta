@@ -1,4 +1,4 @@
-"""AutoTheta v2.0 — Daily Report Generator
+"""AutoTheta v2.1 — Daily Report Generator
 
 Reads today's thoughts.csv and trades.csv, generates a human-readable
 daily diary for each strategy. Run at end of day or anytime.
@@ -37,8 +37,8 @@ def generate_report(report_date=None):
     trades = load_csv(log_dir / "trades.csv")
 
     # ── Analyze thoughts ──
-    # S1 v2.0: RSI(4) on 5-min with hook confirmation
-    total_hooks = len([t for t in thoughts if t.get("Signal") == "RSI4_HOOK"])
+    # S1 v2.1: RSI(5) on 5-min with uptick confirmation
+    total_upticks = len([t for t in thoughts if t.get("Signal") == "RSI5_UPTICK"])
     total_watching = len([t for t in thoughts if t.get("Decision") == "WATCHING"])
     total_filtered = len([t for t in thoughts if t.get("Decision") == "FILTERED"])
     total_skipped = len([t for t in thoughts if t.get("Decision") == "SKIP"])
@@ -47,7 +47,7 @@ def generate_report(report_date=None):
     # Stocks that triggered
     triggered_stocks = set()
     for t in thoughts:
-        if t.get("Signal") == "RSI4_HOOK":
+        if t.get("Signal") == "RSI5_UPTICK":
             triggered_stocks.add(t.get("Stock", ""))
 
     # Filter breakdown
@@ -55,12 +55,14 @@ def generate_report(report_date=None):
     for t in thoughts:
         if t.get("Decision") == "FILTERED":
             reason = t.get("Reason", "")
-            if "EMA" in reason:
-                filter_reasons["Below EMA(200)"] += 1
-            elif "ADX" in reason:
-                filter_reasons["ADX too high (trending)"] += 1
-            elif "VWAP" in reason:
-                filter_reasons["VWAP distance wrong"] += 1
+            if "regime" in reason.lower():
+                filter_reasons["Daily regime failed"] += 1
+            elif "KER" in reason:
+                filter_reasons["KER too high (trending)"] += 1
+            elif "VWAP" in reason or "vwap" in reason.lower():
+                filter_reasons["Above VWAP"] += 1
+            elif "MFI" in reason:
+                filter_reasons["MFI too high (no volume confirmation)"] += 1
             else:
                 filter_reasons["Other"] += 1
 
@@ -69,12 +71,12 @@ def generate_report(report_date=None):
     lowest_rsi = {}
     for t in thoughts:
         stock = t.get("Stock", "")
-        rsi_str = t.get("RSI(4)_5m", "50") or "50"
+        rsi_str = t.get("RSI(5)_5m", "50") or "50"
         try:
             rsi_val = float(rsi_str)
         except ValueError:
             rsi_val = 50.0
-        if rsi_val < 15:
+        if rsi_val < 20:
             oversold_counts[stock] += 1
             if stock not in lowest_rsi or rsi_val < lowest_rsi[stock]:
                 lowest_rsi[stock] = rsi_val
@@ -120,45 +122,45 @@ def generate_report(report_date=None):
     s3_setups = [t for t in thoughts if t.get("Signal") == "S3_SETUP+TRIGGER"]
 
     # ── Determine market mood ──
-    below_ema = filter_reasons.get("Below EMA(200)", 0)
-    adx_high = filter_reasons.get("ADX too high (trending)", 0)
-    vwap_wrong = filter_reasons.get("VWAP distance wrong", 0)
+    regime_fail = filter_reasons.get("Daily regime failed", 0)
+    ker_high = filter_reasons.get("KER too high (trending)", 0)
+    above_vwap = filter_reasons.get("Above VWAP", 0)
+    mfi_high = filter_reasons.get("MFI too high (no volume confirmation)", 0)
 
-    if total_hooks == 0 and total_watching == 0:
+    if total_upticks == 0 and total_watching == 0:
         market_mood = "CALM"
-        market_desc = "No stocks showed RSI(4) oversold on 5-min. Market was steady — no deep dips to trade."
-    elif below_ema + adx_high > total_hooks * 0.7:
+        market_desc = "No stocks showed RSI(5) oversold on 5-min. Market was steady — no deep dips to trade."
+    elif regime_fail + ker_high > total_upticks * 0.7:
         market_mood = "TRENDING"
         market_desc = (
-            f"Stocks were dipping (RSI(4) hook triggered {total_hooks} times) but in a trending "
-            f"regime — high ADX or below EMA(200). Mean reversion doesn't work in trends. "
+            f"Stocks were dipping (RSI(5) uptick triggered {total_upticks} times) but in a trending "
+            f"regime — high KER or daily regime check failed. Mean reversion doesn't work in trends. "
             f"The bot correctly stayed out."
         )
     elif total_bought > 0:
         market_mood = "RANGE-BOUND"
         market_desc = (
             f"Some stocks dipped below VWAP and bounced in a range-bound regime. "
-            f"The bot found {total_bought} quality setups where RSI(4) hooked from below 15 "
-            f"with price 0.3-1.2% below VWAP in a low-ADX environment."
+            f"The bot found {total_bought} quality setups where RSI(5) upticked from below 20 "
+            f"with price below VWAP in a low-KER, MFI-confirmed environment."
         )
-    elif vwap_wrong > total_hooks * 0.5:
+    elif above_vwap > total_upticks * 0.5:
         market_mood = "MISPOSITIONED"
         market_desc = (
-            f"Stocks dipped but VWAP positioning was wrong — either too close to VWAP "
-            f"(no room to bounce) or too far below (catching falling knife). "
-            f"The sweet spot is 0.3-1.2% below VWAP."
+            f"Stocks showed RSI oversold but were above VWAP — "
+            f"mean reversion needs price below the volume-weighted average."
         )
     else:
         market_mood = "MIXED"
         market_desc = (
-            f"Some signals appeared but didn't pass all 4 filters. "
+            f"Some signals appeared but didn't pass all filters. "
             f"The market wasn't clearly range-bound enough for mean reversion."
         )
 
     # ── Build report ──
     lines = []
     lines.append("=" * 60)
-    lines.append(f"  AutoTheta v2.0 Daily Diary — {date_str}")
+    lines.append(f"  AutoTheta v2.1 Daily Diary — {date_str}")
     lines.append("=" * 60)
     lines.append("")
 
@@ -172,45 +174,48 @@ def generate_report(report_date=None):
     # Strategy 1: RSI(4) Mean Reversion on 5-min
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     lines.append("  +----------------------------------------------------+")
-    lines.append("  |  STRATEGY 1: RSI(4) Mean Reversion on 5-min        |")
+    lines.append("  |  STRATEGY 1: RSI(5) Mean Reversion on 5-min        |")
     lines.append("  +----------------------------------------------------+")
     lines.append("")
-    lines.append("  Entry: RSI(4) drops below 15, hooks back above 15")
-    lines.append("  Filters: EMA(200), ADX(14)<25, VWAP 0.3-1.2% below")
+    lines.append("  Entry: RSI(5) < 20 with uptick confirmation")
+    lines.append("  Filters: Daily regime 2/3, KER(10)<0.30, below VWAP, MFI(8)<30")
     lines.append("  Exit: 60% at VWAP touch, 40% at RSI>50, 75-min timeout")
     lines.append("")
 
-    if total_hooks == 0 and total_watching == 0:
-        lines.append("  Today was a quiet day. No stock's RSI(4) dropped below 15")
+    if total_upticks == 0 and total_watching == 0:
+        lines.append("  Today was a quiet day. No stock's RSI(5) dropped below 20")
         lines.append("  on the 5-min chart. This happens on steady, range-bound days")
         lines.append("  without sharp intraday dips.")
     else:
         lines.append(f"  What the bot saw:")
-        lines.append(f"    * {total_watching + total_hooks} times a stock's 5-min RSI(4) was near/below 15")
-        lines.append(f"    * {total_hooks} RSI hook signals (dropped below 15, bounced back)")
+        lines.append(f"    * {total_watching + total_upticks} times a stock's 5-min RSI(5) was near/below 20")
+        lines.append(f"    * {total_upticks} RSI uptick signals (RSI rising from below 20)")
         lines.append(f"    * {len(triggered_stocks)} stocks triggered: {', '.join(sorted(triggered_stocks)) if triggered_stocks else 'none'}")
         lines.append("")
 
         if oversold_counts:
             most_oversold = sorted(oversold_counts.items(), key=lambda x: -x[1])[:5]
-            lines.append(f"  Most oversold stocks today (5-min RSI(4)):")
+            lines.append(f"  Most oversold stocks today (5-min RSI(5)):")
             for stock, count in most_oversold:
                 rsi_low = lowest_rsi.get(stock, 0)
-                lines.append(f"    * {stock:18s} — RSI(4) hit {rsi_low:.1f} (triggered {count}x)")
+                lines.append(f"    * {stock:18s} — RSI(5) hit {rsi_low:.1f} (triggered {count}x)")
             lines.append("")
 
         if total_filtered > 0:
             lines.append(f"  Why the bot DIDN'T trade ({total_filtered} signals filtered):")
             for reason, count in sorted(filter_reasons.items(), key=lambda x: -x[1]):
-                if reason == "Below EMA(200)":
-                    lines.append(f"    * {count}x Below EMA(200) — stock in long-term downtrend")
-                    lines.append(f"      (mean reversion fails when the trend is against you)")
-                elif reason == "ADX too high (trending)":
-                    lines.append(f"    * {count}x ADX(14) >= 25 — market trending, not range-bound")
-                    lines.append(f"      (mean reversion needs range-bound conditions)")
-                elif reason == "VWAP distance wrong":
-                    lines.append(f"    * {count}x VWAP distance outside 0.3-1.2% below")
-                    lines.append(f"      (too close = no room to bounce, too far = falling knife)")
+                if reason == "Daily regime failed":
+                    lines.append(f"    * {count}x Daily regime failed (2/3 conditions not met)")
+                    lines.append(f"      (EMA proximity <8%, RSI(14) 30-65, ADX(14) <25)")
+                elif reason == "KER too high (trending)":
+                    lines.append(f"    * {count}x KER(10) >= 0.30 — market trending, not choppy")
+                    lines.append(f"      (mean reversion needs choppy/range-bound conditions)")
+                elif reason == "Above VWAP":
+                    lines.append(f"    * {count}x Price above VWAP")
+                    lines.append(f"      (mean reversion buys below the volume-weighted average)")
+                elif reason == "MFI too high (no volume confirmation)":
+                    lines.append(f"    * {count}x MFI(8) >= 30 — volume not confirming oversold")
+                    lines.append(f"      (selling pressure not strong enough for a reversal)")
                 else:
                     lines.append(f"    * {count}x {reason}")
             lines.append("")
@@ -235,8 +240,8 @@ def generate_report(report_date=None):
             reason = s.get("Reason", "")
             if "VWAP" in reason:
                 reason_desc = "VWAP touch (60% exit)"
-            elif "RSI4" in reason:
-                reason_desc = "RSI(4) > 50 (final exit)"
+            elif "RSI5" in reason or "RSI4" in reason:
+                reason_desc = "RSI(5) > 50 (final exit)"
             elif "TIME" in reason:
                 reason_desc = "75-min timeout"
             elif "DISASTER" in reason:
@@ -251,9 +256,9 @@ def generate_report(report_date=None):
 
     if not s1_buys and not s1_sells:
         lines.append(f"  S1 Trades: NONE")
-        lines.append(f"  The bot saw opportunities but the 4 filters blocked them all.")
-        lines.append(f"  This is the bot protecting your capital. Fewer filters = more")
-        lines.append(f"  trades but worse quality. No trade > Bad trade.")
+        lines.append(f"  The bot saw opportunities but the filter stack blocked them.")
+        lines.append(f"  v2.1 filters: daily regime, KER, VWAP, MFI. This is the bot")
+        lines.append(f"  protecting your capital. No trade > Bad trade.")
         lines.append("")
 
     lines.append(f"  S1 P&L: Rs{s1_pnl:+,.2f}")
@@ -263,11 +268,11 @@ def generate_report(report_date=None):
     # Strategy 3: Multi-Timeframe RSI Mean Reversion
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     lines.append("  +----------------------------------------------------+")
-    lines.append("  |  STRATEGY 3: RSI 15-min Mean Reversion (v2.0)      |")
+    lines.append("  |  STRATEGY 3: RSI 15-min Mean Reversion (v2.1)      |")
     lines.append("  +----------------------------------------------------+")
     lines.append("")
-    lines.append("  Setup: 15-min RSI(9) < 40, ADX(14) < 30")
-    lines.append("  Trigger: 5-min RSI(9) crosses above 25, price below VWAP")
+    lines.append("  Setup: 15-min RSI(9) < 40, KER(10) < 0.30")
+    lines.append("  Trigger: 5-min RSI(9) crosses above 25, below VWAP, MFI(8)<30")
     lines.append("  Exit: RSI(9) > 50 or VWAP touch, 75-min timeout, 3x ATR stop")
     lines.append("")
 
@@ -325,13 +330,13 @@ def generate_report(report_date=None):
         lines.append("  |  WHAT-IF: If the bot ignored ALL filters?          |")
         lines.append("  +----------------------------------------------------+")
         lines.append("")
-        lines.append("  v2.0 uses only 4 filters (was 7). If the bot had")
-        lines.append("  blindly bought every RSI(4) < 15 hook signal today:")
-        lines.append(f"    * It would have entered {total_hooks} trades")
+        lines.append("  v2.1 uses research-backed filters (regime, KER, MFI).")
+        lines.append("  If the bot had blindly bought every RSI(5) < 20 uptick:")
+        lines.append(f"    * It would have entered {total_upticks} trades")
         if market_mood == "TRENDING":
-            lines.append(f"    * Most were in trending markets (high ADX)")
+            lines.append(f"    * Most were in trending markets (high KER or regime fail)")
             lines.append(f"    * Mean reversion in trends = guaranteed losses")
-            lines.append(f"    * The 4 filters saved you from ~{total_filtered} bad trades")
+            lines.append(f"    * The filter stack saved you from ~{total_filtered} bad trades")
         elif market_mood == "CALM":
             lines.append(f"    * No signals = nothing to trade either way")
         else:
@@ -358,7 +363,7 @@ def generate_report(report_date=None):
 
     if market_mood == "TRENDING":
         lines.append("  If the trend continues tomorrow, expect another quiet day.")
-        lines.append("  Mean reversion shines when the trend exhausts and we go range-bound.")
+        lines.append("  Mean reversion shines when KER drops and the market goes choppy.")
     lines.append("")
     lines.append("=" * 60)
 

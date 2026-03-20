@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════
-# AutoTheta v2.0 — Research-Backed Strategy Config
+# AutoTheta v2.1 — Filter Stack Redesign Config
 # ═══════════════════════════════════════════════
 
 bot:
@@ -29,15 +29,16 @@ vix:
 # ─── Strategy Definitions ───
 strategies:
 
-  # ━━━ Strategy 1: RSI(4) Mean Reversion on 5-min Candles (v2.0) ━━━
+  # ━━━ Strategy 1: RSI(5) Mean Reversion on 5-min Candles (v2.1) ━━━
   - strategy:
-      name: "RSI4_MeanRevert_5min"
+      name: "RSI5_MeanRevert_5min"
       type: "rsi_bounce"
       enabled: true
     parameters:
-      rsi_period: 4                    # RSI(4) on 5-min candles
-      oversold_threshold: 15           # Entry when RSI < 15, then hook back above
-      exit_rsi: 50                     # 40% position exits at RSI(4) > 50
+      rsi_period: 5                    # RSI(5) on 5-min candles
+      oversold_threshold: 20           # Entry when RSI < 20
+      entry_confirmation: "uptick"     # RSI must be rising (not hook above threshold)
+      exit_rsi: 50                     # 40% position exits at RSI(5) > 50
       atr_sl_multiplier: 3.0           # 3x ATR(14) on 15-min = disaster stop only
       time_stop_minutes: 75            # 75-minute time stop
       entry_start: "10:15"             # No entries before 10:15 AM
@@ -45,10 +46,14 @@ strategies:
       hard_exit: "15:00"               # Close everything by 3:00 PM
       max_positions: 3                 # Max 3 concurrent positions
       max_per_sector: 1                # Max 1 per sector
-      adx_max: 25                      # 15-min ADX(14) must be < 25 (range-bound)
-      vwap_below_min_pct: 0.3          # Price must be 0.3-1.2% below VWAP
-      vwap_below_max_pct: 1.2
+      regime_filter: "daily_2of3"      # 2 of 3: EMA proximity, RSI range, ADX
+      intraday_regime: "ker"           # Kaufman Efficiency Ratio
+      ker_period: 10
+      ker_max: 0.30                    # Only trade when KER < 0.30
+      vwap_rule: "below"               # Price must be below VWAP (removed distance bounds)
       vwap_exit_pct: 60               # Exit 60% of position at VWAP touch
+      mfi_period: 8
+      mfi_threshold: 30               # MFI < 30 confirmation
     risk:
       capital_allocation: 250000       # Rs 2.5L allocated
       risk_per_trade_pct: 1.0          # Max 1% risk per trade (Rs 2,500)
@@ -83,21 +88,23 @@ strategies:
       max_consecutive_losses: 3
       cooldown_minutes: 0              # No cooldown (weekly strategy)
 
-  # ━━━ Strategy 3: Multi-Timeframe RSI Mean Reversion (v2.0) ━━━
+  # ━━━ Strategy 3: Multi-Timeframe RSI Mean Reversion (v2.1) ━━━
   - strategy:
       name: "RSI_15min_MeanRevert"
       type: "rsi_15min"
       enabled: true
     parameters:
-      setup_rsi_period: 9             # RSI(9) on 15-min chart (was 14)
-      setup_rsi_threshold: 40         # Connie Brown: oversold in bull = 40 (was 30)
+      setup_rsi_period: 9             # RSI(9) on 15-min chart (Connie Brown)
+      setup_rsi_threshold: 40         # Connie Brown: oversold in bull = 40
       entry_rsi_period: 9             # RSI(9) on 5-min chart
-      entry_rsi_threshold: 25         # Entry when 5-min RSI crosses back above 25 (was 30)
-      exit_rsi_threshold: 50          # Exit when 5-min RSI > 50 (was 55)
-      adx_period: 14                  # ADX(14) — standard (was 10)
-      adx_max: 30                     # Less restrictive (was 25)
-      atr_sl_mult: 3.0               # Disaster stop: 3x ATR(14) on 15-min (was 1.5)
-      time_stop_minutes: 75           # Wider time window (was 50)
+      entry_rsi_threshold: 25         # Entry when 5-min RSI crosses back above 25
+      exit_rsi_threshold: 50          # Exit when 5-min RSI > 50
+      ker_period: 10                  # Kaufman Efficiency Ratio (replaces ADX)
+      ker_max: 0.30                   # Only trade when KER < 0.30 (choppy)
+      mfi_period: 8                   # Money Flow Index period
+      mfi_threshold: 30               # MFI < 30 confirmation
+      atr_sl_mult: 3.0               # Disaster stop: 3x ATR(14) on 15-min
+      time_stop_minutes: 75           # 75-min time window
       max_positions: 3
       max_per_sector: 1
       prime_window_start: "10:15"

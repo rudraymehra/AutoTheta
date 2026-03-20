@@ -1,11 +1,11 @@
-"""Paper trading with LIVE WebSocket data — v2.0 Research-Backed Strategy.
+"""Paper trading with LIVE WebSocket data — v2.1 Filter Stack Redesign.
 
 Uses SmartWebSocketV2 for real-time ticks → builds 1-min candles → runs strategies.
 No historical API needed = no rate limit issues.
 
-S1: RSI(4) Mean Reversion on 5-min candles
-  - Entry: RSI(4) drops below 15, then hooks back above 15
-  - Filters: Daily EMA(200) proxy, 15-min ADX(14)<25, VWAP 0.3-1.2% below
+S1: RSI(5) Mean Reversion on 5-min candles
+  - Entry: RSI(5) < 20 with uptick confirmation (prev < 20, curr > prev)
+  - Filters: Daily 2-of-3 regime check, KER(10)<0.30, below VWAP, MFI(8)<30
   - Exit: 60% at VWAP touch, 40% at RSI>50, 75-min time stop, 3x ATR disaster stop
   - Time: 10:15 AM - 2:00 PM entries, hard exit 3:00 PM
 
@@ -43,7 +43,18 @@ TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET")
 
 
 # ── Indicators ──
-def rsi(series, period=4):
+def rsi(series, period=5):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
+    return 100 - (100 / (1 + rs))
+
+
+def rsi_calc(series, period=14):
+    """RSI with configurable period — used for daily regime check."""
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -89,6 +100,23 @@ def adx_calc(high, low, close, period=14):
     return dx.ewm(alpha=1 / period, min_periods=period).mean()
 
 
+def kaufman_er(series, period=10):
+    """Kaufman Efficiency Ratio. 0=pure chop, 1=perfect trend."""
+    direction = abs(series - series.shift(period))
+    volatility = series.diff().abs().rolling(period).sum()
+    return direction / volatility.replace(0, 1e-10)
+
+
+def mfi(high, low, close, volume, period=8):
+    """Money Flow Index — RSI with volume."""
+    tp = (high + low + close) / 3
+    mf = tp * volume
+    pos_mf = mf.where(tp > tp.shift(1), 0.0).rolling(period).sum()
+    neg_mf = mf.where(tp < tp.shift(1), 0.0).rolling(period).sum()
+    mr = pos_mf / neg_mf.replace(0, 1e-10)
+    return 100 - (100 / (1 + mr))
+
+
 # ── Config ──
 STOCKS = [
     "HDFCBANK-EQ", "ICICIBANK-EQ", "KOTAKBANK-EQ", "AXISBANK-EQ", "SBIN-EQ",
@@ -110,9 +138,9 @@ SECTOR_MAP = {
     "TITAN-EQ": "Other", "MARUTI-EQ": "Auto",
 }
 
-# S1 v2.0: RSI(4) on 5-min candles with hook confirmation
-RSI_PERIOD = 4
-RSI_OVERSOLD = 15              # RSI must drop below 15
+# S1 v2.1: RSI(5) on 5-min candles with uptick confirmation
+RSI_PERIOD = 5
+RSI_OVERSOLD = 20              # RSI must be below 20
 RSI_EXIT_PARTIAL = 50          # 40% position exits at RSI > 50
 ATR_SL_MULT = 3.0              # 3x ATR on 15-min = disaster stop only
 TIME_STOP_MINUTES = 75         # 75-minute time stop
@@ -131,12 +159,13 @@ ENTRY_START_HOUR, ENTRY_START_MIN = 10, 15   # 10:15 AM
 ENTRY_END_HOUR, ENTRY_END_MIN = 14, 0        # 2:00 PM
 HARD_EXIT_HOUR, HARD_EXIT_MIN = 15, 0        # 3:00 PM
 
-# VWAP distance for entry: 0.3% to 1.2% BELOW VWAP
-VWAP_BELOW_MIN = -0.012   # 1.2% below
-VWAP_BELOW_MAX = -0.003   # 0.3% below
+# KER filter on 15-min (replaces ADX)
+KER_PERIOD = 10
+KER_MAX = 0.30                 # Only trade when KER < 0.30 (choppy/mean-reverting)
 
-# ADX filter on 15-min
-ADX_MAX = 25               # range-bound regime only
+# MFI confirmation
+MFI_PERIOD = 8
+MFI_THRESHOLD = 30             # MFI < 30 as volume confirmation
 
 
 def fetch_vix(api):
@@ -192,9 +221,9 @@ class DailyLogger:
         self._thoughts_writer = csv.writer(self._thoughts_file)
         if is_new:
             self._thoughts_writer.writerow([
-                "Time", "Stock", "Price", "RSI(4)_5m", "Signal",
-                "EMA200_1m", "vs_EMA", "VWAP", "VWAP_dist",
-                "ADX14_15m",
+                "Time", "Stock", "Price", "RSI(5)_5m", "Signal",
+                "DailyRegime", "VWAP", "VWAP_dist",
+                "KER10_15m", "MFI8",
                 "Decision", "Reason",
             ])
 
@@ -210,22 +239,21 @@ class DailyLogger:
             ])
 
     def log_thought(self, stock, price, rsi_val, signal_type,
-                    ema200_val, vwap_val, vwap_dist, adx_val,
-                    decision, reason):
+                    regime_ok, vwap_val, vwap_dist, ker_val,
+                    decision, reason, mfi_val=None):
         """Log what the bot saw and why it decided what it did."""
         self._ensure_files()
         now = datetime.now().strftime("%H:%M:%S")
 
-        vs_ema = ""
-        if ema200_val and ema200_val > 0:
-            vs_ema = "ABOVE" if price >= ema200_val else "BELOW"
+        regime_str = "PASS" if regime_ok else ("FAIL" if regime_ok is not None and not regime_ok else "N/A")
 
         self._thoughts_writer.writerow([
             now, stock, f"{price:.2f}", f"{rsi_val:.1f}", signal_type,
-            f"{ema200_val:.2f}" if ema200_val else "N/A", vs_ema,
+            regime_str,
             f"{vwap_val:.2f}" if vwap_val else "N/A",
             f"{vwap_dist:.4f}" if vwap_dist is not None else "N/A",
-            f"{adx_val:.1f}" if adx_val is not None else "N/A",
+            f"{ker_val:.3f}" if ker_val is not None else "N/A",
+            f"{mfi_val:.1f}" if mfi_val is not None else "N/A",
             decision, reason,
         ])
         self._thoughts_file.flush()
@@ -320,9 +348,9 @@ class PaperPortfolio:
             "entry_rsi": rsi_val,
         }
         self.sector_count[sector] += 1
-        self.log.log_trade("BUY", symbol, quantity, price, rsi_val, stop_loss, "RSI4_HOOK")
+        self.log.log_trade("BUY", symbol, quantity, price, rsi_val, stop_loss, "RSI5_UPTICK")
         print(f"\n  >> PAPER BUY {symbol} x{quantity} @ Rs{price:.2f} | "
-              f"SL=Rs{stop_loss:.2f} | RSI(4)={rsi_val:.1f}")
+              f"SL=Rs{stop_loss:.2f} | RSI(5)={rsi_val:.1f}")
 
     def close_position(self, trade_id, price, quantity, reason):
         pos = self.positions.get(trade_id)
@@ -401,11 +429,11 @@ def main():
     reset_s3_state()  # Clear Strategy 3 state for new day
 
     print("=" * 70)
-    print(f"  AutoTheta PAPER TRADING v2.0 — Research-Backed Strategies")
+    print(f"  AutoTheta PAPER TRADING v2.1 — Filter Stack Redesign")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST")
     print(f"  Capital: Rs{CAPITAL:,}")
-    print(f"  S1: RSI(4) on 5-min | Entry: hook above 15 | VWAP below")
-    print(f"  S3: RSI(9) on 15-min setup + 5-min trigger")
+    print(f"  S1: RSI(5) on 5-min | Entry: <20 uptick | Daily regime + KER + MFI")
+    print(f"  S3: RSI(9) on 15-min setup + 5-min trigger + KER + MFI")
     print("=" * 70)
 
     # Authenticate
@@ -439,7 +467,7 @@ def main():
     if vix_size_mult == 0.0:
         print("\n  VIX too high. Bot will monitor but not trade.")
 
-    # Load token map
+    # ── Load token map (needed for daily regime check) ──
     instruments_path = PROJECT_ROOT / "data" / "instruments.json"
     if not instruments_path.exists():
         print("[..] Downloading instrument master...")
@@ -466,6 +494,54 @@ def main():
             token_to_sym[tok] = sym
 
     print(f"[OK] {len(token_map)} stocks mapped")
+
+    # ── Daily Regime Check (2-of-3: EMA proximity, RSI range, ADX) ──
+    daily_regime = {}
+    print("[..] Running daily regime check (REST API)...")
+    for sym, tok in token_map.items():
+        time.sleep(0.5)
+        try:
+            r = api.getCandleData({
+                "exchange": "NSE", "symboltoken": tok, "interval": "ONE_DAY",
+                "fromdate": "2025-06-01 09:15",
+                "todate": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            })
+            if r and r.get("data") and len(r["data"]) > 50:
+                ddf = pd.DataFrame(r["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+                ddf["close"] = pd.to_numeric(ddf["close"], errors="coerce")
+                ddf["high"] = pd.to_numeric(ddf["high"], errors="coerce")
+                ddf["low"] = pd.to_numeric(ddf["low"], errors="coerce")
+                ddf["ema200"] = ema(ddf["close"], 200)
+                ddf["rsi14"] = rsi_calc(ddf["close"], 14)
+                ddf["adx14"] = adx_calc(ddf["high"], ddf["low"], ddf["close"], 14)
+                last = ddf.iloc[-1]
+
+                checks_passed = 0
+                # Check 1: within 8% of daily EMA(200)
+                if pd.notna(last["ema200"]):
+                    if abs(last["close"] - last["ema200"]) / last["ema200"] < 0.08:
+                        checks_passed += 1
+                # Check 2: daily RSI(14) between 30 and 65
+                if pd.notna(last["rsi14"]):
+                    if 30 <= last["rsi14"] <= 65:
+                        checks_passed += 1
+                # Check 3: daily ADX(14) < 25
+                if pd.notna(last["adx14"]):
+                    if last["adx14"] < 25:
+                        checks_passed += 1
+
+                daily_regime[sym] = checks_passed >= 2
+                status = "PASS" if daily_regime[sym] else "FAIL"
+                print(f"    {sym:18s} {status} ({checks_passed}/3 conditions met)")
+            else:
+                daily_regime[sym] = True  # Default allow if no data
+                print(f"    {sym:18s} PASS (insufficient data, default allow)")
+        except Exception as e:
+            daily_regime[sym] = True  # Default allow on error
+            print(f"    {sym:18s} PASS (error: {e}, default allow)")
+
+    regime_pass = sum(1 for v in daily_regime.values() if v)
+    print(f"[OK] Daily regime: {regime_pass}/{len(daily_regime)} stocks passed")
 
     # Initialize
     candle_builder = CandleBuilder()
@@ -667,16 +743,16 @@ def main():
                         pos["vwap_exit_done"] = True
                         continue
 
-            # Exit 2: remaining 40% at RSI(4) > 50 on 5-min
+            # Exit 2: remaining 40% at RSI(5) > 50 on 5-min
             df_5m = df.set_index("timestamp").resample("5min").agg({
                 "open": "first", "high": "max", "low": "min",
                 "close": "last", "volume": "sum",
             }).dropna().reset_index()
             if len(df_5m) >= RSI_PERIOD + 1:
-                df_5m["rsi4"] = rsi(df_5m["close"], RSI_PERIOD)
-                curr_rsi4 = df_5m["rsi4"].iloc[-1]
-                if not pd.isna(curr_rsi4) and curr_rsi4 >= RSI_EXIT_PARTIAL:
-                    portfolio.close_position(tid, curr_price, pos["remaining"], "RSI4_GT50")
+                df_5m["rsi5"] = rsi(df_5m["close"], RSI_PERIOD)
+                curr_rsi5 = df_5m["rsi5"].iloc[-1]
+                if not pd.isna(curr_rsi5) and curr_rsi5 >= RSI_EXIT_PARTIAL:
+                    portfolio.close_position(tid, curr_price, pos["remaining"], "RSI5_GT50")
                     continue
 
         # ── S1: Check entries (only 10:15-14:00, VIX permitting) ──
@@ -691,7 +767,7 @@ def main():
                 if df is None or len(df) < 20:
                     continue
 
-                # Resample 1-min to 5-min for RSI(4)
+                # Resample 1-min to 5-min for RSI(5)
                 df_5m = df.set_index("timestamp").resample("5min").agg({
                     "open": "first", "high": "max", "low": "min",
                     "close": "last", "volume": "sum",
@@ -700,16 +776,16 @@ def main():
                 if len(df_5m) < RSI_PERIOD + 2:
                     continue
 
-                df_5m["rsi4"] = rsi(df_5m["close"], RSI_PERIOD)
-                prev_rsi4 = df_5m["rsi4"].iloc[-2]
-                curr_rsi4 = df_5m["rsi4"].iloc[-1]
+                df_5m["rsi5"] = rsi(df_5m["close"], RSI_PERIOD)
+                prev_rsi5 = df_5m["rsi5"].iloc[-2]
+                curr_rsi5 = df_5m["rsi5"].iloc[-1]
                 curr_price = df["close"].iloc[-1]
 
-                if pd.isna(prev_rsi4) or pd.isna(curr_rsi4):
+                if pd.isna(prev_rsi5) or pd.isna(curr_rsi5):
                     continue
 
-                # Only log thoughts when RSI is interesting (< 25 on 5-min)
-                if curr_rsi4 >= 25 and prev_rsi4 >= 25:
+                # Only log thoughts when RSI is interesting (< 30 on 5-min)
+                if curr_rsi5 >= 30 and prev_rsi5 >= 30:
                     continue
 
                 # Compute indicators for logging
@@ -717,42 +793,48 @@ def main():
                 curr_vwap = df["vwap_val"].iloc[-1]
                 vwap_distance = (curr_price - curr_vwap) / curr_vwap if curr_vwap > 0 else 0
 
-                # EMA(200) on 1-min as proxy for daily 200-EMA
-                ema200_val = None
-                if len(df) >= 200:
-                    ema200_val = ema(df["close"], 200).iloc[-1]
+                # Daily regime check result
+                regime_ok = daily_regime.get(sym, False)
 
-                # 15-min ADX
-                adx_val = None
+                # 15-min KER (Kaufman Efficiency Ratio)
+                ker_val = None
                 df_15m = df.set_index("timestamp").resample("15min").agg({
                     "open": "first", "high": "max", "low": "min",
                     "close": "last", "volume": "sum",
                 }).dropna().reset_index()
-                if len(df_15m) >= 15:
-                    df_15m["adx14"] = adx_calc(df_15m["high"], df_15m["low"], df_15m["close"], 14)
-                    adx_val = df_15m["adx14"].iloc[-1]
+                if len(df_15m) >= KER_PERIOD + 2:
+                    df_15m["ker10"] = kaufman_er(df_15m["close"], KER_PERIOD)
+                    ker_val = df_15m["ker10"].iloc[-1]
 
-                # RSI hook: prev RSI < 15 AND current RSI >= 15
-                is_hook = prev_rsi4 < RSI_OVERSOLD and curr_rsi4 >= RSI_OVERSOLD
+                # MFI(8) on 5-min
+                mfi_val = None
+                if len(df_5m) >= MFI_PERIOD + 2:
+                    df_5m["mfi8"] = mfi(df_5m["high"], df_5m["low"], df_5m["close"], df_5m["volume"], MFI_PERIOD)
+                    mfi_val = df_5m["mfi8"].iloc[-1]
 
-                if not is_hook:
-                    # RSI is low but no hook yet
-                    if curr_rsi4 < RSI_OVERSOLD:
+                # RSI(5) uptick: prev < 20 AND curr > prev (RSI rising from oversold)
+                is_uptick = prev_rsi5 < RSI_OVERSOLD and curr_rsi5 > prev_rsi5
+
+                if not is_uptick:
+                    # RSI is low but no uptick yet
+                    if curr_rsi5 < RSI_OVERSOLD:
                         logger.log_thought(
-                            sym, curr_price, curr_rsi4, "RSI4_LOW",
-                            ema200_val, curr_vwap, vwap_distance, adx_val,
-                            "WATCHING", f"RSI(4)={curr_rsi4:.1f} below 15 — waiting for hook",
+                            sym, curr_price, curr_rsi5, "RSI5_LOW",
+                            regime_ok, curr_vwap, vwap_distance, ker_val,
+                            "WATCHING", f"RSI(5)={curr_rsi5:.1f} below 20 — waiting for uptick",
+                            mfi_val=mfi_val,
                         )
                     continue
 
-                # ── RSI(4) hooked back above 15 — run filter stack ──
+                # ── RSI(5) uptick from below 20 — run filter stack ──
 
                 # Already holding in S1?
                 if any(p["symbol"] == sym for p in portfolio.positions.values()):
                     logger.log_thought(
-                        sym, curr_price, curr_rsi4, "RSI4_HOOK",
-                        ema200_val, curr_vwap, vwap_distance, adx_val,
+                        sym, curr_price, curr_rsi5, "RSI5_UPTICK",
+                        regime_ok, curr_vwap, vwap_distance, ker_val,
                         "SKIP", "Already holding this stock in S1",
+                        mfi_val=mfi_val,
                     )
                     continue
 
@@ -760,65 +842,81 @@ def main():
                 s3_syms = {p["symbol"] for p in get_s3_positions().values()}
                 if sym in s3_syms:
                     logger.log_thought(
-                        sym, curr_price, curr_rsi4, "RSI4_HOOK",
-                        ema200_val, curr_vwap, vwap_distance, adx_val,
+                        sym, curr_price, curr_rsi5, "RSI5_UPTICK",
+                        regime_ok, curr_vwap, vwap_distance, ker_val,
                         "SKIP", "Already holding in S3",
+                        mfi_val=mfi_val,
                     )
                     continue
 
                 if len(portfolio.positions) >= MAX_POSITIONS:
                     logger.log_thought(
-                        sym, curr_price, curr_rsi4, "RSI4_HOOK",
-                        ema200_val, curr_vwap, vwap_distance, adx_val,
+                        sym, curr_price, curr_rsi5, "RSI5_UPTICK",
+                        regime_ok, curr_vwap, vwap_distance, ker_val,
                         "SKIP", f"Max positions ({MAX_POSITIONS}) reached",
+                        mfi_val=mfi_val,
                     )
                     continue
 
                 sector = SECTOR_MAP.get(sym, "Other")
                 if portfolio.sector_count.get(sector, 0) >= MAX_PER_SECTOR:
                     logger.log_thought(
-                        sym, curr_price, curr_rsi4, "RSI4_HOOK",
-                        ema200_val, curr_vwap, vwap_distance, adx_val,
+                        sym, curr_price, curr_rsi5, "RSI5_UPTICK",
+                        regime_ok, curr_vwap, vwap_distance, ker_val,
                         "SKIP", f"Sector limit: {sector} already has a position",
+                        mfi_val=mfi_val,
                     )
                     continue
 
-                # Filter 1: Daily 200-EMA proxy (price above 1-min EMA200)
-                if ema200_val is not None and curr_price < ema200_val:
+                # Filter 1: Daily regime check (2 of 3 conditions)
+                if not regime_ok:
                     logger.log_thought(
-                        sym, curr_price, curr_rsi4, "RSI4_HOOK",
-                        ema200_val, curr_vwap, vwap_distance, adx_val,
-                        "FILTERED", f"Price below EMA(200) proxy ({ema200_val:.2f})",
+                        sym, curr_price, curr_rsi5, "RSI5_UPTICK",
+                        regime_ok, curr_vwap, vwap_distance, ker_val,
+                        "FILTERED", "Daily regime check failed (2/3 conditions not met)",
+                        mfi_val=mfi_val,
                     )
-                    print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI(4)={curr_rsi4:.1f} "
-                          f"— FILTERED (below EMA200)")
+                    print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI(5)={curr_rsi5:.1f} "
+                          f"— FILTERED (daily regime)")
                     continue
 
-                # Filter 2: 15-min ADX(14) < 25 (range-bound)
-                if adx_val is not None and not pd.isna(adx_val) and adx_val >= ADX_MAX:
+                # Filter 2: KER(10) < 0.30 on 15-min (choppy/mean-reverting)
+                if ker_val is not None and not pd.isna(ker_val) and ker_val >= KER_MAX:
                     logger.log_thought(
-                        sym, curr_price, curr_rsi4, "RSI4_HOOK",
-                        ema200_val, curr_vwap, vwap_distance, adx_val,
-                        "FILTERED", f"ADX(14)={adx_val:.1f} >= {ADX_MAX} (trending, not range-bound)",
+                        sym, curr_price, curr_rsi5, "RSI5_UPTICK",
+                        regime_ok, curr_vwap, vwap_distance, ker_val,
+                        "FILTERED", f"KER(10)={ker_val:.3f} >= {KER_MAX} (trending, not mean-reverting)",
+                        mfi_val=mfi_val,
                     )
-                    print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI(4)={curr_rsi4:.1f} "
-                          f"— FILTERED (ADX too high: {adx_val:.1f})")
+                    print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI(5)={curr_rsi5:.1f} "
+                          f"— FILTERED (KER too high: {ker_val:.3f})")
                     continue
 
-                # Filter 3: VWAP positioning — 0.3% to 1.2% BELOW VWAP
-                if not (VWAP_BELOW_MIN <= vwap_distance <= VWAP_BELOW_MAX):
+                # Filter 3: Price must be below VWAP
+                if curr_vwap > 0 and curr_price >= curr_vwap:
                     logger.log_thought(
-                        sym, curr_price, curr_rsi4, "RSI4_HOOK",
-                        ema200_val, curr_vwap, vwap_distance, adx_val,
-                        "FILTERED", f"VWAP dist={vwap_distance*100:.2f}% (need -1.2% to -0.3%)",
+                        sym, curr_price, curr_rsi5, "RSI5_UPTICK",
+                        regime_ok, curr_vwap, vwap_distance, ker_val,
+                        "FILTERED", f"Price above VWAP ({curr_vwap:.2f})",
+                        mfi_val=mfi_val,
                     )
-                    print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI(4)={curr_rsi4:.1f} "
-                          f"— FILTERED (VWAP distance: {vwap_distance*100:.2f}%)")
+                    print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI(5)={curr_rsi5:.1f} "
+                          f"— FILTERED (above VWAP)")
                     continue
 
-                # Filter 4: RSI hook already confirmed above
+                # Filter 4: MFI(8) < 30 confirmation (optional — skip if unavailable)
+                if mfi_val is not None and not pd.isna(mfi_val) and mfi_val >= MFI_THRESHOLD:
+                    logger.log_thought(
+                        sym, curr_price, curr_rsi5, "RSI5_UPTICK",
+                        regime_ok, curr_vwap, vwap_distance, ker_val,
+                        "FILTERED", f"MFI(8)={mfi_val:.1f} >= {MFI_THRESHOLD} (volume not confirming)",
+                        mfi_val=mfi_val,
+                    )
+                    print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI(5)={curr_rsi5:.1f} "
+                          f"— FILTERED (MFI too high: {mfi_val:.1f})")
+                    continue
 
-                # All 4 filters passed — calculate position using 15-min ATR
+                # All filters passed — calculate position using 15-min ATR
                 if df_15m is not None and len(df_15m) >= 15:
                     atr_15m = atr_calc(df_15m["high"], df_15m["low"], df_15m["close"], 14)
                     curr_atr = atr_15m.iloc[-1]
@@ -843,14 +941,15 @@ def main():
 
                 # ── ENTRY ──
                 logger.log_thought(
-                    sym, curr_price, curr_rsi4, "RSI4_HOOK",
-                    ema200_val, curr_vwap, vwap_distance, adx_val,
-                    "BUY", f"All 4 filters passed | Qty={qty} SL={stop_loss:.2f} ATR={curr_atr:.2f} VIX_mult={vix_size_mult}",
+                    sym, curr_price, curr_rsi5, "RSI5_UPTICK",
+                    regime_ok, curr_vwap, vwap_distance, ker_val,
+                    "BUY", f"All filters passed | Qty={qty} SL={stop_loss:.2f} ATR={curr_atr:.2f} VIX_mult={vix_size_mult}",
+                    mfi_val=mfi_val,
                 )
 
                 trade_counter[0] += 1
                 tid = f"PAPER-{trade_counter[0]:04d}"
-                portfolio.open_position(tid, sym, curr_price, qty, stop_loss, curr_rsi4)
+                portfolio.open_position(tid, sym, curr_price, qty, stop_loss, curr_rsi5)
 
         # ── Strategy 3: Multi-Timeframe RSI Mean Reversion ──
         try:
