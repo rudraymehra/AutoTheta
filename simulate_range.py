@@ -198,7 +198,7 @@ def fetch_day(api, token_map, target_date, nifty_daily_df=None):
     regime_details = {}
     if nifty_daily_df is not None and len(nifty_daily_df) > 50:
         # Filter to data up to target_date
-        nifty_daily_df["timestamp"] = pd.to_datetime(nifty_daily_df["timestamp"])
+        nifty_daily_df["timestamp"] = pd.to_datetime(nifty_daily_df["timestamp"], utc=True).dt.tz_localize(None)
         mask = nifty_daily_df["timestamp"] <= pd.Timestamp(f"{target_date} 15:30")
         nifty_subset = nifty_daily_df[mask].copy()
         if len(nifty_subset) > 50:
@@ -318,7 +318,8 @@ def simulate_one_day(data, daily_regime=None, market_regime=None, regime_details
                 pos = positions[tid]
                 sym = pos["symbol"]
                 if sym in data and i < len(data[sym]):
-                    pnl = (data[sym]["close"].iloc[i] - pos["entry_price"]) * pos["remaining"]
+                    exit_p = data[sym]["close"].iloc[i]
+                    pnl = (pos["entry_price"] - exit_p) * pos["remaining"] if pos.get("side") == "SHORT" else (exit_p - pos["entry_price"]) * pos["remaining"]
                     pos["realized_pnl"] += pnl
                     closed.append({**pos, "exit_price": data[sym]["close"].iloc[i], "exit_reason": "EOD"})
                     sector_count[pos["sector"]] = max(0, sector_count[pos["sector"]] - 1)
@@ -338,30 +339,38 @@ def simulate_one_day(data, daily_regime=None, market_regime=None, regime_details
 
             if pos["strategy"] == "S1":
                 r5 = row.get("rsi5_5m")
-                if row["close"] <= pos["stop_loss"]:
-                    pos["realized_pnl"] += (row["close"] - pos["entry_price"]) * pos["remaining"]
+                is_short = pos.get("side") == "SHORT"
+
+                def calc_pnl(entry, exit, qty):
+                    return (entry - exit) * qty if is_short else (exit - entry) * qty
+
+                # Stop-loss: ABOVE for short, BELOW for long
+                sl_hit = row["close"] >= pos["stop_loss"] if is_short else row["close"] <= pos["stop_loss"]
+                if sl_hit:
+                    pos["realized_pnl"] += calc_pnl(pos["entry_price"], row["close"], pos["remaining"])
                     closed.append({**pos, "exit_price": row["close"], "exit_reason": "DISASTER_SL"})
                     sector_count[pos["sector"]] = max(0, sector_count[pos["sector"]] - 1)
                     del positions[tid]
                     continue
                 if hour >= 15:
-                    pos["realized_pnl"] += (row["close"] - pos["entry_price"]) * pos["remaining"]
+                    pos["realized_pnl"] += calc_pnl(pos["entry_price"], row["close"], pos["remaining"])
                     closed.append({**pos, "exit_price": row["close"], "exit_reason": "HARD_3PM"})
                     sector_count[pos["sector"]] = max(0, sector_count[pos["sector"]] - 1)
                     del positions[tid]
                     continue
                 if pos["candles_held"] >= 75:
-                    pos["realized_pnl"] += (row["close"] - pos["entry_price"]) * pos["remaining"]
+                    pos["realized_pnl"] += calc_pnl(pos["entry_price"], row["close"], pos["remaining"])
                     closed.append({**pos, "exit_price": row["close"], "exit_reason": "TIME75"})
                     sector_count[pos["sector"]] = max(0, sector_count[pos["sector"]] - 1)
                     del positions[tid]
                     continue
-                # VWAP touch: 60% exit
-                if not pos.get("vwap_exit_done") and row["close"] >= row["vwap"]:
+                # VWAP exit: for LONG touch from below, for SHORT drop from above
+                vwap_exit_cond = (row["close"] <= row["vwap"]) if is_short else (row["close"] >= row["vwap"])
+                if not pos.get("vwap_exit_done") and vwap_exit_cond:
                     eq = int(pos["initial_qty"] * 0.6)
                     eq = min(eq, pos["remaining"])
                     if eq > 0:
-                        pos["realized_pnl"] += (row["close"] - pos["entry_price"]) * eq
+                        pos["realized_pnl"] += calc_pnl(pos["entry_price"], row["close"], eq)
                         pos["remaining"] -= eq
                         pos["vwap_exit_done"] = True
                         if pos["remaining"] <= 0:
@@ -369,9 +378,10 @@ def simulate_one_day(data, daily_regime=None, market_regime=None, regime_details
                             sector_count[pos["sector"]] = max(0, sector_count[pos["sector"]] - 1)
                             del positions[tid]
                             continue
-                # RSI(5) > 50: remaining exit
-                if not pd.isna(r5) and r5 >= 50:
-                    pos["realized_pnl"] += (row["close"] - pos["entry_price"]) * pos["remaining"]
+                # RSI exit: for LONG >50, for SHORT <50
+                rsi_exit_cond = (not pd.isna(r5) and r5 <= 50) if is_short else (not pd.isna(r5) and r5 >= 50)
+                if rsi_exit_cond:
+                    pos["realized_pnl"] += calc_pnl(pos["entry_price"], row["close"], pos["remaining"])
                     closed.append({**pos, "exit_price": row["close"], "exit_reason": "RSI5_50"})
                     sector_count[pos["sector"]] = max(0, sector_count[pos["sector"]] - 1)
                     del positions[tid]
@@ -408,11 +418,62 @@ def simulate_one_day(data, daily_regime=None, market_regime=None, regime_details
                     sector_count[pos["sector"]] = max(0, sector_count[pos["sector"]] - 1)
                     del positions[tid]
 
-        # S1 entries — 10:15-14:00 only
+        # S1 entries — 10:15-14:00, BULL regime only
         now_min = hour * 60 + minute
         s1_entry_ok = (10 * 60 + 15) <= now_min < (14 * 60)
 
-        if s1_entry_ok:
+        # BEAR regime: sell overbought rallies instead of buying dips
+        if s1_entry_ok and market_regime == MarketRegime.BEAR:
+            for sym, df in data.items():
+                if i >= len(df) or i < 1:
+                    continue
+                row = df.iloc[i]
+                prev = df.iloc[i - 1]
+                curr_r5 = row.get("rsi5_5m")
+                prev_r5 = prev.get("rsi5_5m") if i > 0 else None
+                if curr_r5 is None or prev_r5 is None or pd.isna(curr_r5) or pd.isna(prev_r5):
+                    continue
+                # RSI(5) was above 80 and started dropping (downtick from overbought)
+                if not (prev_r5 > 80 and curr_r5 < prev_r5):
+                    continue
+                s1_signals += 1
+                if any(p["symbol"] == sym for p in positions.values()):
+                    continue
+                s1_pos = sum(1 for p in positions.values() if p["strategy"] == "S1")
+                if s1_pos >= 3:
+                    continue
+                sector = SECTOR_MAP.get(sym, "Other")
+                if sector_count.get(sector, 0) >= 1:
+                    continue
+                # Must be ABOVE VWAP (selling the rally)
+                if row["vwap"] > 0 and row["close"] < row["vwap"]:
+                    continue
+                # Position sizing with 3x ATR on 15-min
+                a15 = row.get("atr14_15m")
+                a = a15 if pd.notna(a15) else row["close"] * 0.01
+                sl = round(row["close"] + 3.0 * a, 2)  # Stop ABOVE for shorts
+                risk = sl - row["close"]
+                if risk <= 0:
+                    continue
+                qty = min(int(RISK_PER_TRADE / risk), int(83000 / row["close"]))
+                if qty <= 0:
+                    continue
+                trade_count += 1
+                positions[f"S1-{trade_count}"] = {
+                    "strategy": "S1", "symbol": sym, "entry_price": row["close"],
+                    "quantity": qty, "initial_qty": qty, "remaining": qty,
+                    "stop_loss": sl, "status": "open",
+                    "entry_time": ts.strftime("%H:%M"), "candles_held": 0,
+                    "realized_pnl": 0.0, "sector": sector, "side": "SHORT",
+                    "vwap_exit_done": False,
+                }
+                sector_count[sector] += 1
+
+        # CRASH regime: no entries at all
+        if market_regime == MarketRegime.CRASH:
+            s1_entry_ok = False
+
+        if s1_entry_ok and market_regime != MarketRegime.BEAR:
             for sym, df in data.items():
                 if i >= len(df) or i < 1:
                     continue
@@ -467,7 +528,7 @@ def simulate_one_day(data, daily_regime=None, market_regime=None, regime_details
                     "stop_loss": sl, "status": "open",
                     "entry_time": ts.strftime("%H:%M"), "candles_held": 0,
                     "realized_pnl": 0.0, "sector": sector,
-                    "vwap_exit_done": False,
+                    "side": "LONG", "vwap_exit_done": False,
                 }
                 sector_count[sector] += 1
 
@@ -569,18 +630,27 @@ def main():
         if not m.empty:
             token_map[sym] = m.iloc[0]["token"]
 
-    print(f"  {len(token_map)} stocks | Fetching data...\n")
+    print(f"  {len(token_map)} stocks | Fetching data...")
+
+    # Fetch Nifty daily data for regime classification
+    print("  Fetching Nifty daily data for regime...")
+    nifty_daily_df = fetch_nifty_daily(api, end)
+    if nifty_daily_df is not None:
+        print(f"  Got {len(nifty_daily_df)} daily candles\n")
+    else:
+        print("  Could not fetch daily data — regime defaults to BULL\n")
+        nifty_daily_df = None
 
     results = {}
     for d in days:
         ds = d.isoformat()
         sys.stdout.write(f"  {ds} ({d.strftime('%A')[:3]})... ")
         sys.stdout.flush()
-        data, day_regime = fetch_day(api, token_map, d)
+        data, day_regime, mkt_regime, regime_det = fetch_day(api, token_map, d, nifty_daily_df)
         if not data:
             print("HOLIDAY/NO DATA")
             continue
-        r = simulate_one_day(data, day_regime)
+        r = simulate_one_day(data, day_regime, mkt_regime, regime_det)
         if r:
             results[ds] = r
             total = r["s1_trades"] + r["s3_trades"]
