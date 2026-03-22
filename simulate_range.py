@@ -168,7 +168,7 @@ def fetch_nifty_daily(api, target_date):
         r = api.getCandleData({
             "exchange": "NSE", "symboltoken": "99926000",
             "interval": "ONE_DAY",
-            "fromdate": "2025-04-01 09:15",
+            "fromdate": "2024-01-01 09:15",
             "todate": f"{target_date} 15:30",
         })
         if r and r.get("data") and len(r["data"]) > 50:
@@ -652,9 +652,12 @@ def main():
             continue
         r = simulate_one_day(data, day_regime, mkt_regime, regime_det)
         if r:
+            r["regime"] = mkt_regime.value if mkt_regime else "BULL"
             results[ds] = r
             total = r["s1_trades"] + r["s3_trades"]
-            print(f"S1:{r['s1_trades']}t/{r['s1_signals']}s S3:{r['s3_trades']}t/{r['s3_setups']}s | P&L: Rs{r['total_pnl']:+,.2f}")
+            regime_tag = mkt_regime.value if mkt_regime else "?"
+            dma_d = regime_det.get("dma_dist_pct", "?") if regime_det else "?"
+            print(f"[{regime_tag}] S1:{r['s1_trades']}t/{r['s1_signals']}s S3:{r['s3_trades']}t/{r['s3_setups']}s | DMA:{dma_d}% | P&L: Rs{r['total_pnl']:+,.2f}")
         else:
             print("NO DATA")
 
