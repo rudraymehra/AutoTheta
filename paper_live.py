@@ -1,13 +1,27 @@
-"""Paper trading with LIVE WebSocket data — v2.1 Filter Stack Redesign.
+"""Paper trading with LIVE WebSocket data — v3.0 Regime-Adaptive System.
 
 Uses SmartWebSocketV2 for real-time ticks → builds 1-min candles → runs strategies.
 No historical API needed = no rate limit issues.
 
-S1: RSI(5) Mean Reversion on 5-min candles
+Market regime classified once at 9:15 AM via 200-DMA, VIX, ADX(14):
+  BULL:  S1 RSI mean-reversion (buy dips) — existing strategy
+  BEAR:  Reverse MR (sell overbought rallies, short to VWAP)
+  CRASH: No new entries, manage existing positions + circuit breaker
+
+S1: RSI(5) Mean Reversion on 5-min candles (BULL regime)
   - Entry: RSI(5) < 20 with uptick confirmation (prev < 20, curr > prev)
   - Filters: Daily 2-of-3 regime check, KER(10)<0.30, below VWAP, MFI(8)<30
   - Exit: 60% at VWAP touch, 40% at RSI>50, 75-min time stop, 3x ATR disaster stop
   - Time: 10:15 AM - 2:00 PM entries, hard exit 3:00 PM
+
+BEAR scan: Sell overbought rallies (BEAR regime)
+  - Entry: RSI(5) was ABOVE 80 prev candle AND RSI downtick, above VWAP, KER<0.30
+  - Exit: 60% when price drops to VWAP, 40% when RSI<50, 75-min time stop
+  - SHORT positions: P&L = (entry - exit) * qty
+
+Circuit breakers:
+  - 3 consecutive losses = stop for day
+  - Rs 7,500 daily hard cap
 
 Generates two log files daily in logs/YYYY-MM-DD/:
   1. thoughts.csv — Every signal the bot considered + why it acted or didn't
@@ -34,6 +48,7 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env")
 
+from core.regime import classify_regime, MarketRegime
 from strategies.rsi_15min import scan_15min_rsi, reset_state as reset_s3_state, get_positions as get_s3_positions, get_daily_pnl as get_s3_pnl
 
 API_KEY = os.getenv("ANGEL_API_KEY")
@@ -167,6 +182,14 @@ KER_MAX = 0.30                 # Only trade when KER < 0.30 (choppy/mean-reverti
 MFI_PERIOD = 8
 MFI_THRESHOLD = 30             # MFI < 30 as volume confirmation
 
+# BEAR regime: sell overbought rallies (short to VWAP)
+BEAR_RSI_OVERBOUGHT = 80       # RSI(5) must have been above 80
+BEAR_RSI_EXIT = 50             # Exit remaining 40% when RSI < 50
+
+# Circuit breakers
+MAX_CONSECUTIVE_LOSSES = 3     # 3 consecutive losses = stop for day
+DAILY_HARD_LOSS_CAP = -7500    # Rs 7,500 daily hard cap
+
 
 def fetch_vix(api):
     """Fetch India VIX at startup via REST API. Returns VIX value or None."""
@@ -225,6 +248,7 @@ class DailyLogger:
                 "DailyRegime", "VWAP", "VWAP_dist",
                 "KER10_15m", "MFI8",
                 "Decision", "Reason",
+                "MarketRegime", "Side", "IBS",
             ])
 
         # Trades log — what the bot actually did
@@ -236,11 +260,13 @@ class DailyLogger:
             self._trades_writer.writerow([
                 "Time", "Action", "Stock", "Qty", "Price",
                 "RSI", "Stop_Loss", "Reason", "P&L",
+                "Side", "MarketRegime",
             ])
 
     def log_thought(self, stock, price, rsi_val, signal_type,
                     regime_ok, vwap_val, vwap_dist, ker_val,
-                    decision, reason, mfi_val=None):
+                    decision, reason, mfi_val=None,
+                    market_regime="", side="LONG", ibs=None):
         """Log what the bot saw and why it decided what it did."""
         self._ensure_files()
         now = datetime.now().strftime("%H:%M:%S")
@@ -255,11 +281,14 @@ class DailyLogger:
             f"{ker_val:.3f}" if ker_val is not None else "N/A",
             f"{mfi_val:.1f}" if mfi_val is not None else "N/A",
             decision, reason,
+            market_regime, side,
+            f"{ibs:.3f}" if ibs is not None else "N/A",
         ])
         self._thoughts_file.flush()
 
     def log_trade(self, action, stock, qty, price, rsi_val=0,
-                  stop_loss=0, reason="", pnl=0):
+                  stop_loss=0, reason="", pnl=0, side="LONG",
+                  market_regime=""):
         """Log an actual trade action."""
         self._ensure_files()
         now = datetime.now().strftime("%H:%M:%S")
@@ -269,6 +298,7 @@ class DailyLogger:
             f"{stop_loss:.2f}" if stop_loss else "",
             reason,
             f"{pnl:+.2f}" if pnl else "",
+            side, market_regime,
         ])
         self._trades_file.flush()
 
@@ -337,7 +367,8 @@ class PaperPortfolio:
         self.sector_count = defaultdict(int)
         self.log = logger
 
-    def open_position(self, trade_id, symbol, price, quantity, stop_loss, rsi_val):
+    def open_position(self, trade_id, symbol, price, quantity, stop_loss, rsi_val,
+                      side="LONG", market_regime="BULL"):
         sector = SECTOR_MAP.get(symbol, "Other")
         self.positions[trade_id] = {
             "symbol": symbol, "entry_price": price, "quantity": quantity,
@@ -346,25 +377,35 @@ class PaperPortfolio:
             "entry_time": datetime.now(), "entry_timestamp": datetime.now(),
             "vwap_exit_done": False,
             "entry_rsi": rsi_val,
+            "side": side,
         }
         self.sector_count[sector] += 1
-        self.log.log_trade("BUY", symbol, quantity, price, rsi_val, stop_loss, "RSI5_UPTICK")
-        print(f"\n  >> PAPER BUY {symbol} x{quantity} @ Rs{price:.2f} | "
-              f"SL=Rs{stop_loss:.2f} | RSI(5)={rsi_val:.1f}")
+        action = "SHORT" if side == "SHORT" else "BUY"
+        reason = "BEAR_OVERBOUGHT" if side == "SHORT" else "RSI5_UPTICK"
+        self.log.log_trade(action, symbol, quantity, price, rsi_val, stop_loss,
+                           reason, side=side, market_regime=market_regime)
+        print(f"\n  >> PAPER {action} {symbol} x{quantity} @ Rs{price:.2f} | "
+              f"SL=Rs{stop_loss:.2f} | RSI(5)={rsi_val:.1f} | {side}")
 
     def close_position(self, trade_id, price, quantity, reason):
         pos = self.positions.get(trade_id)
         if not pos:
-            return
-        pnl = (price - pos["entry_price"]) * quantity
+            return 0.0
+        side = pos.get("side", "LONG")
+        if side == "LONG":
+            pnl = (price - pos["entry_price"]) * quantity
+        else:  # SHORT
+            pnl = (pos["entry_price"] - price) * quantity
         pos["realized_pnl"] = pos.get("realized_pnl", 0.0) + pnl
         pos["remaining"] -= quantity
         self.daily_pnl += pnl
 
-        self.log.log_trade("SELL", pos["symbol"], quantity, price, reason=reason, pnl=pnl)
+        action = "COVER" if side == "SHORT" else "SELL"
+        self.log.log_trade(action, pos["symbol"], quantity, price, reason=reason,
+                           pnl=pnl, side=side)
 
         emoji = "+" if pnl >= 0 else ""
-        print(f"\n  << PAPER SELL {pos['symbol']} x{quantity} @ Rs{price:.2f} | "
+        print(f"\n  << PAPER {action} {pos['symbol']} x{quantity} @ Rs{price:.2f} | "
               f"reason={reason} | P&L=Rs{emoji}{pnl:.2f}")
 
         if pos["remaining"] <= 0:
@@ -375,6 +416,7 @@ class PaperPortfolio:
                 "exit_reason": reason, "total_pnl": pos.get("realized_pnl", 0.0),
             })
             del self.positions[trade_id]
+        return pnl
 
     def summary(self):
         pnl_pct = (self.daily_pnl / self.capital) * 100
@@ -429,10 +471,11 @@ def main():
     reset_s3_state()  # Clear Strategy 3 state for new day
 
     print("=" * 70)
-    print(f"  AutoTheta PAPER TRADING v2.1 — Filter Stack Redesign")
+    print(f"  AutoTheta PAPER TRADING v3.0 — Regime-Adaptive System")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST")
     print(f"  Capital: Rs{CAPITAL:,}")
-    print(f"  S1: RSI(5) on 5-min | Entry: <20 uptick | Daily regime + KER + MFI")
+    print(f"  Regime detection: 200-DMA + VIX + ADX(14) at startup")
+    print(f"  BULL: S1 RSI(5) buy dips | BEAR: sell overbought rallies | CRASH: cash")
     print(f"  S3: RSI(9) on 15-min setup + 5-min trigger + KER + MFI")
     print("=" * 70)
 
@@ -466,6 +509,31 @@ def main():
 
     if vix_size_mult == 0.0:
         print("\n  VIX too high. Bot will monitor but not trade.")
+
+    # ── Market Regime Detection (once at startup) ──
+    print("[..] Classifying market regime...")
+    regime, regime_details = classify_regime(api)
+    prior_ibs = regime_details.get("prior_day_ibs", 0.5)
+    ibs_size_mult = 0.5 if prior_ibs > 0.25 else 1.0
+
+    print(f"[OK] Market Regime: {regime.value}")
+    nifty_200dma = regime_details.get('nifty_200dma', 0)
+    print(f"     Nifty: {regime_details.get('current_nifty', 'N/A')} | "
+          f"200-DMA: {nifty_200dma:.0f} | "
+          f"Dist: {regime_details.get('dma_dist_pct', 'N/A')}% | "
+          f"VIX: {regime_details.get('india_vix', 'N/A')} | "
+          f"ADX: {regime_details.get('adx14', 'N/A')}")
+    print(f"     IBS: {prior_ibs:.3f} | IBS size mult: {ibs_size_mult}")
+    if regime == MarketRegime.CRASH:
+        print(f"[!!] CRASH REGIME — {regime_details.get('crash_triggers', [])} — minimal trading only")
+        vix_size_mult = 0.0  # Override: no new entries in crash
+    elif regime == MarketRegime.BEAR:
+        print(f"[..] BEAR REGIME — selling overbought rallies (reverse mean-reversion)")
+        print(f"     Bear conditions met: {regime_details.get('bear_conditions_met', 0)}/3")
+
+    # Circuit breaker state
+    daily_losses_consecutive = 0
+    circuit_breaker_active = False
 
     # ── Load token map (needed for daily regime check) ──
     instruments_path = PROJECT_ROOT / "data" / "instruments.json"
@@ -643,9 +711,9 @@ def main():
             combined_pnl = portfolio.daily_pnl + get_s3_pnl()
             pnl_pct = (combined_pnl / portfolio.capital) * 100
             vix_tag = f" VIX={vix:.1f}" if vix else ""
-            print(f"\r  [{now.strftime('%H:%M:%S')}] "
+            print(f"\r  [{now.strftime('%H:%M:%S')}] [{regime.value}] "
                   f"Candles: {max_candles} | Feeds: {active}/{len(token_map)} | "
-                  f"Pos: S1={len(portfolio.positions)} S3={len(s3_positions)} | "
+                  f"Pos: {len(portfolio.positions)}+{len(s3_positions)} | "
                   f"P&L: Rs{combined_pnl:+,.2f} ({pnl_pct:+.2f}%){vix_tag}",
                   end="", flush=True)
 
@@ -702,7 +770,7 @@ def main():
                 running[0] = False
             continue
 
-        # ── S1: Check exits for open positions ──
+        # ── S1: Check exits for open positions (LONG and SHORT) ──
         for tid in list(portfolio.positions.keys()):
             pos = portfolio.positions.get(tid)
             if not pos:
@@ -715,241 +783,462 @@ def main():
 
             curr_price = df["close"].iloc[-1]
             elapsed_min = (now - pos["entry_timestamp"]).total_seconds() / 60
-
-            # Disaster stop: 3x ATR on 15-min
-            if curr_price <= pos["stop_loss"]:
-                portfolio.close_position(tid, curr_price, pos["remaining"], "DISASTER_STOP")
-                continue
+            side = pos.get("side", "LONG")
 
             # Hard exit at 3:00 PM
             if now.hour >= HARD_EXIT_HOUR and now.minute >= HARD_EXIT_MIN:
-                portfolio.close_position(tid, curr_price, pos["remaining"], "HARD_EXIT_3PM")
+                pnl = portfolio.close_position(tid, curr_price, pos["remaining"], "HARD_EXIT_3PM")
+                if pnl < 0:
+                    daily_losses_consecutive += 1
+                else:
+                    daily_losses_consecutive = 0
                 continue
 
             # Time stop: 75 minutes
             if elapsed_min >= TIME_STOP_MINUTES:
-                portfolio.close_position(tid, curr_price, pos["remaining"], "TIME_STOP_75M")
+                pnl = portfolio.close_position(tid, curr_price, pos["remaining"], "TIME_STOP_75M")
+                if pnl < 0:
+                    daily_losses_consecutive += 1
+                else:
+                    daily_losses_consecutive = 0
                 continue
 
-            # Exit 1: 60% at VWAP touch
-            if not pos["vwap_exit_done"]:
-                df["vwap_val"] = vwap_calc(df)
-                curr_vwap = df["vwap_val"].iloc[-1]
-                if not pd.isna(curr_vwap) and curr_vwap > 0 and curr_price >= curr_vwap:
-                    exit_qty = int(pos["initial_qty"] * 0.6)
-                    exit_qty = min(exit_qty, pos["remaining"])
-                    if exit_qty > 0:
-                        portfolio.close_position(tid, curr_price, exit_qty, "VWAP_TOUCH_60pct")
-                        pos["vwap_exit_done"] = True
-                        continue
-
-            # Exit 2: remaining 40% at RSI(5) > 50 on 5-min
-            df_5m = df.set_index("timestamp").resample("5min").agg({
-                "open": "first", "high": "max", "low": "min",
-                "close": "last", "volume": "sum",
-            }).dropna().reset_index()
-            if len(df_5m) >= RSI_PERIOD + 1:
-                df_5m["rsi5"] = rsi(df_5m["close"], RSI_PERIOD)
-                curr_rsi5 = df_5m["rsi5"].iloc[-1]
-                if not pd.isna(curr_rsi5) and curr_rsi5 >= RSI_EXIT_PARTIAL:
-                    portfolio.close_position(tid, curr_price, pos["remaining"], "RSI5_GT50")
+            if side == "LONG":
+                # Disaster stop: price below stop (long)
+                if curr_price <= pos["stop_loss"]:
+                    pnl = portfolio.close_position(tid, curr_price, pos["remaining"], "DISASTER_STOP")
+                    daily_losses_consecutive += 1
                     continue
 
-        # ── S1: Check entries (only 10:15-14:00, VIX permitting) ──
+                # Exit 1: 60% at VWAP touch (long — price rises to VWAP)
+                if not pos["vwap_exit_done"]:
+                    df["vwap_val"] = vwap_calc(df)
+                    curr_vwap = df["vwap_val"].iloc[-1]
+                    if not pd.isna(curr_vwap) and curr_vwap > 0 and curr_price >= curr_vwap:
+                        exit_qty = int(pos["initial_qty"] * 0.6)
+                        exit_qty = min(exit_qty, pos["remaining"])
+                        if exit_qty > 0:
+                            portfolio.close_position(tid, curr_price, exit_qty, "VWAP_TOUCH_60pct")
+                            pos["vwap_exit_done"] = True
+                            continue
+
+                # Exit 2: remaining 40% at RSI(5) > 50 on 5-min
+                df_5m = df.set_index("timestamp").resample("5min").agg({
+                    "open": "first", "high": "max", "low": "min",
+                    "close": "last", "volume": "sum",
+                }).dropna().reset_index()
+                if len(df_5m) >= RSI_PERIOD + 1:
+                    df_5m["rsi5"] = rsi(df_5m["close"], RSI_PERIOD)
+                    curr_rsi5 = df_5m["rsi5"].iloc[-1]
+                    if not pd.isna(curr_rsi5) and curr_rsi5 >= RSI_EXIT_PARTIAL:
+                        pnl = portfolio.close_position(tid, curr_price, pos["remaining"], "RSI5_GT50")
+                        if pnl < 0:
+                            daily_losses_consecutive += 1
+                        else:
+                            daily_losses_consecutive = 0
+                        continue
+
+            else:  # SHORT positions (BEAR regime)
+                # Disaster stop: price above stop (short — stop is ABOVE entry)
+                if curr_price >= pos["stop_loss"]:
+                    pnl = portfolio.close_position(tid, curr_price, pos["remaining"], "BEAR_DISASTER_STOP")
+                    daily_losses_consecutive += 1
+                    continue
+
+                # Exit 1: 60% when price drops back to VWAP (short — price falls to VWAP)
+                if not pos["vwap_exit_done"]:
+                    df["vwap_val"] = vwap_calc(df)
+                    curr_vwap = df["vwap_val"].iloc[-1]
+                    if not pd.isna(curr_vwap) and curr_vwap > 0 and curr_price <= curr_vwap:
+                        exit_qty = int(pos["initial_qty"] * 0.6)
+                        exit_qty = min(exit_qty, pos["remaining"])
+                        if exit_qty > 0:
+                            portfolio.close_position(tid, curr_price, exit_qty, "BEAR_VWAP_DROP_60pct")
+                            pos["vwap_exit_done"] = True
+                            continue
+
+                # Exit 2: remaining 40% when RSI(5) < 50 on 5-min
+                df_5m = df.set_index("timestamp").resample("5min").agg({
+                    "open": "first", "high": "max", "low": "min",
+                    "close": "last", "volume": "sum",
+                }).dropna().reset_index()
+                if len(df_5m) >= RSI_PERIOD + 1:
+                    df_5m["rsi5"] = rsi(df_5m["close"], RSI_PERIOD)
+                    curr_rsi5 = df_5m["rsi5"].iloc[-1]
+                    if not pd.isna(curr_rsi5) and curr_rsi5 < BEAR_RSI_EXIT:
+                        pnl = portfolio.close_position(tid, curr_price, pos["remaining"], "BEAR_RSI5_LT50")
+                        if pnl < 0:
+                            daily_losses_consecutive += 1
+                        else:
+                            daily_losses_consecutive = 0
+                        continue
+
+        # ── Circuit breaker checks before any new entry ──
+        if daily_losses_consecutive >= MAX_CONSECUTIVE_LOSSES:
+            if not circuit_breaker_active:
+                print(f"\n  [CIRCUIT BREAKER] {daily_losses_consecutive} consecutive losses — no new entries today")
+                circuit_breaker_active = True
+        if portfolio.daily_pnl <= DAILY_HARD_LOSS_CAP:
+            if not circuit_breaker_active:
+                print(f"\n  [HARD STOP] Daily P&L Rs{portfolio.daily_pnl:+,.2f} hit cap Rs{DAILY_HARD_LOSS_CAP:,} — no new entries")
+                circuit_breaker_active = True
+
+        # ── Check entries (only 10:15-14:00, VIX permitting, circuit breaker off) ──
         now_min = now.hour * 60 + now.minute
         entry_start = ENTRY_START_HOUR * 60 + ENTRY_START_MIN
         entry_end = ENTRY_END_HOUR * 60 + ENTRY_END_MIN
         in_entry_window = entry_start <= now_min < entry_end
 
-        if in_entry_window and vix_size_mult > 0:
-            for sym, tok in token_map.items():
-                df = candle_builder.get_df(tok)
-                if df is None or len(df) < 20:
-                    continue
+        # CRASH regime: no new entries at all
+        if regime == MarketRegime.CRASH:
+            in_entry_window = False
 
-                # Resample 1-min to 5-min for RSI(5)
-                df_5m = df.set_index("timestamp").resample("5min").agg({
-                    "open": "first", "high": "max", "low": "min",
-                    "close": "last", "volume": "sum",
-                }).dropna().reset_index()
+        if in_entry_window and vix_size_mult > 0 and not circuit_breaker_active:
 
-                if len(df_5m) < RSI_PERIOD + 2:
-                    continue
+            # ══════════════════════════════════════════════════════
+            # BULL REGIME: S1 — RSI(5) mean-reversion (buy dips)
+            # ══════════════════════════════════════════════════════
+            if regime == MarketRegime.BULL:
+                for sym, tok in token_map.items():
+                    df = candle_builder.get_df(tok)
+                    if df is None or len(df) < 20:
+                        continue
 
-                df_5m["rsi5"] = rsi(df_5m["close"], RSI_PERIOD)
-                prev_rsi5 = df_5m["rsi5"].iloc[-2]
-                curr_rsi5 = df_5m["rsi5"].iloc[-1]
-                curr_price = df["close"].iloc[-1]
+                    # Resample 1-min to 5-min for RSI(5)
+                    df_5m = df.set_index("timestamp").resample("5min").agg({
+                        "open": "first", "high": "max", "low": "min",
+                        "close": "last", "volume": "sum",
+                    }).dropna().reset_index()
 
-                if pd.isna(prev_rsi5) or pd.isna(curr_rsi5):
-                    continue
+                    if len(df_5m) < RSI_PERIOD + 2:
+                        continue
 
-                # Only log thoughts when RSI is interesting (< 30 on 5-min)
-                if curr_rsi5 >= 30 and prev_rsi5 >= 30:
-                    continue
+                    df_5m["rsi5"] = rsi(df_5m["close"], RSI_PERIOD)
+                    prev_rsi5 = df_5m["rsi5"].iloc[-2]
+                    curr_rsi5 = df_5m["rsi5"].iloc[-1]
+                    curr_price = df["close"].iloc[-1]
 
-                # Compute indicators for logging
-                df["vwap_val"] = vwap_calc(df)
-                curr_vwap = df["vwap_val"].iloc[-1]
-                vwap_distance = (curr_price - curr_vwap) / curr_vwap if curr_vwap > 0 else 0
+                    if pd.isna(prev_rsi5) or pd.isna(curr_rsi5):
+                        continue
 
-                # Daily regime check result
-                regime_ok = daily_regime.get(sym, False)
+                    # Only log thoughts when RSI is interesting (< 30 on 5-min)
+                    if curr_rsi5 >= 30 and prev_rsi5 >= 30:
+                        continue
 
-                # 15-min KER (Kaufman Efficiency Ratio)
-                ker_val = None
-                df_15m = df.set_index("timestamp").resample("15min").agg({
-                    "open": "first", "high": "max", "low": "min",
-                    "close": "last", "volume": "sum",
-                }).dropna().reset_index()
-                if len(df_15m) >= KER_PERIOD + 2:
-                    df_15m["ker10"] = kaufman_er(df_15m["close"], KER_PERIOD)
-                    ker_val = df_15m["ker10"].iloc[-1]
+                    # Compute indicators for logging
+                    df["vwap_val"] = vwap_calc(df)
+                    curr_vwap = df["vwap_val"].iloc[-1]
+                    vwap_distance = (curr_price - curr_vwap) / curr_vwap if curr_vwap > 0 else 0
 
-                # MFI(8) on 5-min
-                mfi_val = None
-                if len(df_5m) >= MFI_PERIOD + 2:
-                    df_5m["mfi8"] = mfi(df_5m["high"], df_5m["low"], df_5m["close"], df_5m["volume"], MFI_PERIOD)
-                    mfi_val = df_5m["mfi8"].iloc[-1]
+                    # Daily regime check result
+                    regime_ok = daily_regime.get(sym, False)
 
-                # RSI(5) uptick: prev < 20 AND curr > prev (RSI rising from oversold)
-                is_uptick = prev_rsi5 < RSI_OVERSOLD and curr_rsi5 > prev_rsi5
+                    # 15-min KER (Kaufman Efficiency Ratio)
+                    ker_val = None
+                    df_15m = df.set_index("timestamp").resample("15min").agg({
+                        "open": "first", "high": "max", "low": "min",
+                        "close": "last", "volume": "sum",
+                    }).dropna().reset_index()
+                    if len(df_15m) >= KER_PERIOD + 2:
+                        df_15m["ker10"] = kaufman_er(df_15m["close"], KER_PERIOD)
+                        ker_val = df_15m["ker10"].iloc[-1]
 
-                if not is_uptick:
-                    # RSI is low but no uptick yet
-                    if curr_rsi5 < RSI_OVERSOLD:
+                    # MFI(8) on 5-min
+                    mfi_val = None
+                    if len(df_5m) >= MFI_PERIOD + 2:
+                        df_5m["mfi8"] = mfi(df_5m["high"], df_5m["low"], df_5m["close"], df_5m["volume"], MFI_PERIOD)
+                        mfi_val = df_5m["mfi8"].iloc[-1]
+
+                    # RSI(5) uptick: prev < 20 AND curr > prev (RSI rising from oversold)
+                    is_uptick = prev_rsi5 < RSI_OVERSOLD and curr_rsi5 > prev_rsi5
+
+                    if not is_uptick:
+                        # RSI is low but no uptick yet
+                        if curr_rsi5 < RSI_OVERSOLD:
+                            logger.log_thought(
+                                sym, curr_price, curr_rsi5, "RSI5_LOW",
+                                regime_ok, curr_vwap, vwap_distance, ker_val,
+                                "WATCHING", f"RSI(5)={curr_rsi5:.1f} below 20 — waiting for uptick",
+                                mfi_val=mfi_val, market_regime=regime.value,
+                                side="LONG", ibs=prior_ibs,
+                            )
+                        continue
+
+                    # ── RSI(5) uptick from below 20 — run filter stack ──
+
+                    # Already holding in S1?
+                    if any(p["symbol"] == sym for p in portfolio.positions.values()):
                         logger.log_thought(
-                            sym, curr_price, curr_rsi5, "RSI5_LOW",
+                            sym, curr_price, curr_rsi5, "RSI5_UPTICK",
                             regime_ok, curr_vwap, vwap_distance, ker_val,
-                            "WATCHING", f"RSI(5)={curr_rsi5:.1f} below 20 — waiting for uptick",
-                            mfi_val=mfi_val,
+                            "SKIP", "Already holding this stock in S1",
+                            mfi_val=mfi_val, market_regime=regime.value,
+                            side="LONG", ibs=prior_ibs,
                         )
-                    continue
+                        continue
 
-                # ── RSI(5) uptick from below 20 — run filter stack ──
+                    # Already holding in S3?
+                    s3_syms = {p["symbol"] for p in get_s3_positions().values()}
+                    if sym in s3_syms:
+                        logger.log_thought(
+                            sym, curr_price, curr_rsi5, "RSI5_UPTICK",
+                            regime_ok, curr_vwap, vwap_distance, ker_val,
+                            "SKIP", "Already holding in S3",
+                            mfi_val=mfi_val, market_regime=regime.value,
+                            side="LONG", ibs=prior_ibs,
+                        )
+                        continue
 
-                # Already holding in S1?
-                if any(p["symbol"] == sym for p in portfolio.positions.values()):
+                    if len(portfolio.positions) >= MAX_POSITIONS:
+                        logger.log_thought(
+                            sym, curr_price, curr_rsi5, "RSI5_UPTICK",
+                            regime_ok, curr_vwap, vwap_distance, ker_val,
+                            "SKIP", f"Max positions ({MAX_POSITIONS}) reached",
+                            mfi_val=mfi_val, market_regime=regime.value,
+                            side="LONG", ibs=prior_ibs,
+                        )
+                        continue
+
+                    sector = SECTOR_MAP.get(sym, "Other")
+                    if portfolio.sector_count.get(sector, 0) >= MAX_PER_SECTOR:
+                        logger.log_thought(
+                            sym, curr_price, curr_rsi5, "RSI5_UPTICK",
+                            regime_ok, curr_vwap, vwap_distance, ker_val,
+                            "SKIP", f"Sector limit: {sector} already has a position",
+                            mfi_val=mfi_val, market_regime=regime.value,
+                            side="LONG", ibs=prior_ibs,
+                        )
+                        continue
+
+                    # Filter 1: Daily regime check (2 of 3 conditions)
+                    if not regime_ok:
+                        logger.log_thought(
+                            sym, curr_price, curr_rsi5, "RSI5_UPTICK",
+                            regime_ok, curr_vwap, vwap_distance, ker_val,
+                            "FILTERED", "Daily regime check failed (2/3 conditions not met)",
+                            mfi_val=mfi_val, market_regime=regime.value,
+                            side="LONG", ibs=prior_ibs,
+                        )
+                        print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI(5)={curr_rsi5:.1f} "
+                              f"— FILTERED (daily regime)")
+                        continue
+
+                    # Filter 2: KER(10) < 0.30 on 15-min (choppy/mean-reverting)
+                    if ker_val is not None and not pd.isna(ker_val) and ker_val >= KER_MAX:
+                        logger.log_thought(
+                            sym, curr_price, curr_rsi5, "RSI5_UPTICK",
+                            regime_ok, curr_vwap, vwap_distance, ker_val,
+                            "FILTERED", f"KER(10)={ker_val:.3f} >= {KER_MAX} (trending, not mean-reverting)",
+                            mfi_val=mfi_val, market_regime=regime.value,
+                            side="LONG", ibs=prior_ibs,
+                        )
+                        print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI(5)={curr_rsi5:.1f} "
+                              f"— FILTERED (KER too high: {ker_val:.3f})")
+                        continue
+
+                    # Filter 3: Price must be below VWAP
+                    if curr_vwap > 0 and curr_price >= curr_vwap:
+                        logger.log_thought(
+                            sym, curr_price, curr_rsi5, "RSI5_UPTICK",
+                            regime_ok, curr_vwap, vwap_distance, ker_val,
+                            "FILTERED", f"Price above VWAP ({curr_vwap:.2f})",
+                            mfi_val=mfi_val, market_regime=regime.value,
+                            side="LONG", ibs=prior_ibs,
+                        )
+                        print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI(5)={curr_rsi5:.1f} "
+                              f"— FILTERED (above VWAP)")
+                        continue
+
+                    # Filter 4: MFI(8) < 30 confirmation (optional — skip if unavailable)
+                    if mfi_val is not None and not pd.isna(mfi_val) and mfi_val >= MFI_THRESHOLD:
+                        logger.log_thought(
+                            sym, curr_price, curr_rsi5, "RSI5_UPTICK",
+                            regime_ok, curr_vwap, vwap_distance, ker_val,
+                            "FILTERED", f"MFI(8)={mfi_val:.1f} >= {MFI_THRESHOLD} (volume not confirming)",
+                            mfi_val=mfi_val, market_regime=regime.value,
+                            side="LONG", ibs=prior_ibs,
+                        )
+                        print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI(5)={curr_rsi5:.1f} "
+                              f"— FILTERED (MFI too high: {mfi_val:.1f})")
+                        continue
+
+                    # All filters passed — calculate position using 15-min ATR
+                    if df_15m is not None and len(df_15m) >= 15:
+                        atr_15m = atr_calc(df_15m["high"], df_15m["low"], df_15m["close"], 14)
+                        curr_atr = atr_15m.iloc[-1]
+                    else:
+                        # Fallback to 1-min ATR * sqrt(15)
+                        atr_1m = atr_calc(df["high"], df["low"], df["close"], 14)
+                        curr_atr = atr_1m.iloc[-1] * (15 ** 0.5) if not pd.isna(atr_1m.iloc[-1]) else curr_price * 0.01
+
+                    if pd.isna(curr_atr) or curr_atr <= 0:
+                        curr_atr = curr_price * 0.01
+
+                    stop_loss = round(curr_price - ATR_SL_MULT * curr_atr, 2)
+                    risk_per_share = curr_price - stop_loss
+                    if risk_per_share <= 0:
+                        continue
+
+                    # IBS filter: reduce size by 50% if prior day IBS > 0.25
+                    effective_risk = RISK_PER_TRADE * vix_size_mult * ibs_size_mult
+                    qty = int(effective_risk / risk_per_share)
+                    qty = min(qty, int(83000 / curr_price))
+                    if qty <= 0:
+                        continue
+
+                    # ── ENTRY ──
                     logger.log_thought(
                         sym, curr_price, curr_rsi5, "RSI5_UPTICK",
                         regime_ok, curr_vwap, vwap_distance, ker_val,
-                        "SKIP", "Already holding this stock in S1",
-                        mfi_val=mfi_val,
+                        "BUY", f"All filters passed | Qty={qty} SL={stop_loss:.2f} ATR={curr_atr:.2f} VIX_mult={vix_size_mult} IBS_mult={ibs_size_mult}",
+                        mfi_val=mfi_val, market_regime=regime.value,
+                        side="LONG", ibs=prior_ibs,
                     )
-                    continue
 
-                # Already holding in S3?
-                s3_syms = {p["symbol"] for p in get_s3_positions().values()}
-                if sym in s3_syms:
+                    trade_counter[0] += 1
+                    tid = f"PAPER-{trade_counter[0]:04d}"
+                    portfolio.open_position(tid, sym, curr_price, qty, stop_loss, curr_rsi5,
+                                            side="LONG", market_regime=regime.value)
+
+            # ══════════════════════════════════════════════════════
+            # BEAR REGIME: Sell overbought rallies (short to VWAP)
+            # ══════════════════════════════════════════════════════
+            elif regime == MarketRegime.BEAR:
+                for sym, tok in token_map.items():
+                    df = candle_builder.get_df(tok)
+                    if df is None or len(df) < 20:
+                        continue
+
+                    # Resample 1-min to 5-min for RSI(5)
+                    df_5m = df.set_index("timestamp").resample("5min").agg({
+                        "open": "first", "high": "max", "low": "min",
+                        "close": "last", "volume": "sum",
+                    }).dropna().reset_index()
+
+                    if len(df_5m) < RSI_PERIOD + 2:
+                        continue
+
+                    df_5m["rsi5"] = rsi(df_5m["close"], RSI_PERIOD)
+                    prev_rsi5 = df_5m["rsi5"].iloc[-2]
+                    curr_rsi5 = df_5m["rsi5"].iloc[-1]
+                    curr_price = df["close"].iloc[-1]
+
+                    if pd.isna(prev_rsi5) or pd.isna(curr_rsi5):
+                        continue
+
+                    # Only log thoughts when RSI is interesting (> 70 on 5-min)
+                    if curr_rsi5 <= 70 and prev_rsi5 <= 70:
+                        continue
+
+                    # Compute indicators for logging
+                    df["vwap_val"] = vwap_calc(df)
+                    curr_vwap = df["vwap_val"].iloc[-1]
+                    vwap_distance = (curr_price - curr_vwap) / curr_vwap if curr_vwap > 0 else 0
+
+                    # 15-min KER
+                    ker_val = None
+                    df_15m = df.set_index("timestamp").resample("15min").agg({
+                        "open": "first", "high": "max", "low": "min",
+                        "close": "last", "volume": "sum",
+                    }).dropna().reset_index()
+                    if len(df_15m) >= KER_PERIOD + 2:
+                        df_15m["ker10"] = kaufman_er(df_15m["close"], KER_PERIOD)
+                        ker_val = df_15m["ker10"].iloc[-1]
+
+                    # BEAR entry: RSI(5) was ABOVE 80 on prev candle AND downtick (curr < prev)
+                    is_bear_signal = prev_rsi5 > BEAR_RSI_OVERBOUGHT and curr_rsi5 < prev_rsi5
+
+                    if not is_bear_signal:
+                        if curr_rsi5 > BEAR_RSI_OVERBOUGHT:
+                            logger.log_thought(
+                                sym, curr_price, curr_rsi5, "BEAR_RSI5_HIGH",
+                                True, curr_vwap, vwap_distance, ker_val,
+                                "WATCHING", f"RSI(5)={curr_rsi5:.1f} above 80 — waiting for downtick",
+                                market_regime=regime.value, side="SHORT",
+                                ibs=prior_ibs,
+                            )
+                        continue
+
+                    # ── BEAR downtick from above 80 — run filter stack ──
+
+                    # Already holding?
+                    if any(p["symbol"] == sym for p in portfolio.positions.values()):
+                        logger.log_thought(
+                            sym, curr_price, curr_rsi5, "BEAR_RSI5_DOWNTICK",
+                            True, curr_vwap, vwap_distance, ker_val,
+                            "SKIP", "Already holding this stock",
+                            market_regime=regime.value, side="SHORT",
+                            ibs=prior_ibs,
+                        )
+                        continue
+
+                    if len(portfolio.positions) >= MAX_POSITIONS:
+                        continue
+
+                    sector = SECTOR_MAP.get(sym, "Other")
+                    if portfolio.sector_count.get(sector, 0) >= MAX_PER_SECTOR:
+                        continue
+
+                    # Filter: Price must be ABOVE VWAP (we're selling the rally back to mean)
+                    if curr_vwap > 0 and curr_price <= curr_vwap:
+                        logger.log_thought(
+                            sym, curr_price, curr_rsi5, "BEAR_RSI5_DOWNTICK",
+                            True, curr_vwap, vwap_distance, ker_val,
+                            "FILTERED", f"Price below VWAP (need above VWAP for bear short)",
+                            market_regime=regime.value, side="SHORT",
+                            ibs=prior_ibs,
+                        )
+                        continue
+
+                    # Filter: KER(10) < 0.30 on 15-min (still range-bound)
+                    if ker_val is not None and not pd.isna(ker_val) and ker_val >= KER_MAX:
+                        logger.log_thought(
+                            sym, curr_price, curr_rsi5, "BEAR_RSI5_DOWNTICK",
+                            True, curr_vwap, vwap_distance, ker_val,
+                            "FILTERED", f"KER(10)={ker_val:.3f} >= {KER_MAX} (trending)",
+                            market_regime=regime.value, side="SHORT",
+                            ibs=prior_ibs,
+                        )
+                        continue
+
+                    # Position sizing: 3x ATR on 15-min ABOVE entry (short stop)
+                    if df_15m is not None and len(df_15m) >= 15:
+                        atr_15m = atr_calc(df_15m["high"], df_15m["low"], df_15m["close"], 14)
+                        curr_atr = atr_15m.iloc[-1]
+                    else:
+                        atr_1m = atr_calc(df["high"], df["low"], df["close"], 14)
+                        curr_atr = atr_1m.iloc[-1] * (15 ** 0.5) if not pd.isna(atr_1m.iloc[-1]) else curr_price * 0.01
+
+                    if pd.isna(curr_atr) or curr_atr <= 0:
+                        curr_atr = curr_price * 0.01
+
+                    # Short stop is ABOVE entry
+                    stop_loss = round(curr_price + ATR_SL_MULT * curr_atr, 2)
+                    risk_per_share = stop_loss - curr_price
+                    if risk_per_share <= 0:
+                        continue
+
+                    effective_risk = RISK_PER_TRADE * vix_size_mult * ibs_size_mult
+                    qty = int(effective_risk / risk_per_share)
+                    qty = min(qty, int(83000 / curr_price))
+                    if qty <= 0:
+                        continue
+
+                    # ── BEAR SHORT ENTRY ──
                     logger.log_thought(
-                        sym, curr_price, curr_rsi5, "RSI5_UPTICK",
-                        regime_ok, curr_vwap, vwap_distance, ker_val,
-                        "SKIP", "Already holding in S3",
-                        mfi_val=mfi_val,
+                        sym, curr_price, curr_rsi5, "BEAR_RSI5_DOWNTICK",
+                        True, curr_vwap, vwap_distance, ker_val,
+                        "SHORT", f"Bear filters passed | Qty={qty} SL={stop_loss:.2f} ATR={curr_atr:.2f}",
+                        market_regime=regime.value, side="SHORT",
+                        ibs=prior_ibs,
                     )
-                    continue
 
-                if len(portfolio.positions) >= MAX_POSITIONS:
-                    logger.log_thought(
-                        sym, curr_price, curr_rsi5, "RSI5_UPTICK",
-                        regime_ok, curr_vwap, vwap_distance, ker_val,
-                        "SKIP", f"Max positions ({MAX_POSITIONS}) reached",
-                        mfi_val=mfi_val,
-                    )
-                    continue
+                    trade_counter[0] += 1
+                    tid = f"BEAR-{trade_counter[0]:04d}"
+                    portfolio.open_position(tid, sym, curr_price, qty, stop_loss, curr_rsi5,
+                                            side="SHORT", market_regime=regime.value)
 
-                sector = SECTOR_MAP.get(sym, "Other")
-                if portfolio.sector_count.get(sector, 0) >= MAX_PER_SECTOR:
-                    logger.log_thought(
-                        sym, curr_price, curr_rsi5, "RSI5_UPTICK",
-                        regime_ok, curr_vwap, vwap_distance, ker_val,
-                        "SKIP", f"Sector limit: {sector} already has a position",
-                        mfi_val=mfi_val,
-                    )
-                    continue
-
-                # Filter 1: Daily regime check (2 of 3 conditions)
-                if not regime_ok:
-                    logger.log_thought(
-                        sym, curr_price, curr_rsi5, "RSI5_UPTICK",
-                        regime_ok, curr_vwap, vwap_distance, ker_val,
-                        "FILTERED", "Daily regime check failed (2/3 conditions not met)",
-                        mfi_val=mfi_val,
-                    )
-                    print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI(5)={curr_rsi5:.1f} "
-                          f"— FILTERED (daily regime)")
-                    continue
-
-                # Filter 2: KER(10) < 0.30 on 15-min (choppy/mean-reverting)
-                if ker_val is not None and not pd.isna(ker_val) and ker_val >= KER_MAX:
-                    logger.log_thought(
-                        sym, curr_price, curr_rsi5, "RSI5_UPTICK",
-                        regime_ok, curr_vwap, vwap_distance, ker_val,
-                        "FILTERED", f"KER(10)={ker_val:.3f} >= {KER_MAX} (trending, not mean-reverting)",
-                        mfi_val=mfi_val,
-                    )
-                    print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI(5)={curr_rsi5:.1f} "
-                          f"— FILTERED (KER too high: {ker_val:.3f})")
-                    continue
-
-                # Filter 3: Price must be below VWAP
-                if curr_vwap > 0 and curr_price >= curr_vwap:
-                    logger.log_thought(
-                        sym, curr_price, curr_rsi5, "RSI5_UPTICK",
-                        regime_ok, curr_vwap, vwap_distance, ker_val,
-                        "FILTERED", f"Price above VWAP ({curr_vwap:.2f})",
-                        mfi_val=mfi_val,
-                    )
-                    print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI(5)={curr_rsi5:.1f} "
-                          f"— FILTERED (above VWAP)")
-                    continue
-
-                # Filter 4: MFI(8) < 30 confirmation (optional — skip if unavailable)
-                if mfi_val is not None and not pd.isna(mfi_val) and mfi_val >= MFI_THRESHOLD:
-                    logger.log_thought(
-                        sym, curr_price, curr_rsi5, "RSI5_UPTICK",
-                        regime_ok, curr_vwap, vwap_distance, ker_val,
-                        "FILTERED", f"MFI(8)={mfi_val:.1f} >= {MFI_THRESHOLD} (volume not confirming)",
-                        mfi_val=mfi_val,
-                    )
-                    print(f"\n  [{now.strftime('%H:%M')}] {sym} RSI(5)={curr_rsi5:.1f} "
-                          f"— FILTERED (MFI too high: {mfi_val:.1f})")
-                    continue
-
-                # All filters passed — calculate position using 15-min ATR
-                if df_15m is not None and len(df_15m) >= 15:
-                    atr_15m = atr_calc(df_15m["high"], df_15m["low"], df_15m["close"], 14)
-                    curr_atr = atr_15m.iloc[-1]
-                else:
-                    # Fallback to 1-min ATR * sqrt(15)
-                    atr_1m = atr_calc(df["high"], df["low"], df["close"], 14)
-                    curr_atr = atr_1m.iloc[-1] * (15 ** 0.5) if not pd.isna(atr_1m.iloc[-1]) else curr_price * 0.01
-
-                if pd.isna(curr_atr) or curr_atr <= 0:
-                    curr_atr = curr_price * 0.01
-
-                stop_loss = round(curr_price - ATR_SL_MULT * curr_atr, 2)
-                risk_per_share = curr_price - stop_loss
-                if risk_per_share <= 0:
-                    continue
-
-                effective_risk = RISK_PER_TRADE * vix_size_mult
-                qty = int(effective_risk / risk_per_share)
-                qty = min(qty, int(83000 / curr_price))
-                if qty <= 0:
-                    continue
-
-                # ── ENTRY ──
-                logger.log_thought(
-                    sym, curr_price, curr_rsi5, "RSI5_UPTICK",
-                    regime_ok, curr_vwap, vwap_distance, ker_val,
-                    "BUY", f"All filters passed | Qty={qty} SL={stop_loss:.2f} ATR={curr_atr:.2f} VIX_mult={vix_size_mult}",
-                    mfi_val=mfi_val,
-                )
-
-                trade_counter[0] += 1
-                tid = f"PAPER-{trade_counter[0]:04d}"
-                portfolio.open_position(tid, sym, curr_price, qty, stop_loss, curr_rsi5)
+            # CRASH regime: no entries (handled above by setting in_entry_window = False)
 
         # ── Strategy 3: Multi-Timeframe RSI Mean Reversion ──
         try:

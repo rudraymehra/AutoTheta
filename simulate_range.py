@@ -1,8 +1,13 @@
 """Simulate a range of trading days and produce a summary table.
 
-v2.1 — Filter stack redesign:
-  S1: RSI(5) on 5-min, uptick from <20, daily regime 2/3, KER<0.30, below VWAP, MFI(8)<30
-  S3: RSI(9)<40 on 15-min, RSI(9) cross above 25 on 5-min, KER(10)<0.30, 3x ATR
+v3.0 — Regime-adaptive system:
+  Market regime classified each day: BULL / BEAR / CRASH
+  BULL: S1 RSI(5) buy dips + S3 15-min mean reversion
+  BEAR: Sell overbought rallies (short to VWAP)
+  CRASH: No new entries
+
+  Circuit breakers: 3 consecutive losses = stop, Rs 7,500 daily hard cap
+  IBS filter: prior day IBS > 0.25 reduces position size 50%
 
 Usage: python simulate_range.py 2026-02-03 2026-02-13
 """
@@ -23,6 +28,8 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env")
+
+from core.regime import classify_regime_from_data, MarketRegime
 
 # ── Indicators ──
 def rsi(series, period=5):
@@ -154,18 +161,48 @@ def fetch_daily_regime(api, token_map, target_date):
     return daily_regime
 
 
-def fetch_day(api, token_map, target_date):
+def fetch_nifty_daily(api, target_date):
+    """Fetch Nifty daily candles for regime detection."""
+    try:
+        time.sleep(0.5)
+        r = api.getCandleData({
+            "exchange": "NSE", "symboltoken": "99926000",
+            "interval": "ONE_DAY",
+            "fromdate": "2025-04-01 09:15",
+            "todate": f"{target_date} 15:30",
+        })
+        if r and r.get("data") and len(r["data"]) > 50:
+            return pd.DataFrame(r["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+    except Exception:
+        pass
+    return None
+
+
+def fetch_day(api, token_map, target_date, nifty_daily_df=None):
     """Fetch 1-min candles for one day."""
-    cache = PROJECT_ROOT / "data" / f"cache_{target_date}_v21.pkl"
+    cache = PROJECT_ROOT / "data" / f"cache_{target_date}_v30.pkl"
     if cache.exists():
         with open(cache, "rb") as f:
             cached = pickle.load(f)
-        if isinstance(cached, tuple):
+        if isinstance(cached, tuple) and len(cached) == 4:
             return cached
-        return cached, {sym: True for sym in cached}
+        elif isinstance(cached, tuple) and len(cached) == 2:
+            return cached[0], cached[1], MarketRegime.BULL, {}
+        return cached, {sym: True for sym in cached}, MarketRegime.BULL, {}
 
     # Fetch daily regime data
     daily_regime = fetch_daily_regime(api, token_map, target_date)
+
+    # Market regime classification
+    market_regime = MarketRegime.BULL
+    regime_details = {}
+    if nifty_daily_df is not None and len(nifty_daily_df) > 50:
+        # Filter to data up to target_date
+        nifty_daily_df["timestamp"] = pd.to_datetime(nifty_daily_df["timestamp"])
+        mask = nifty_daily_df["timestamp"] <= pd.Timestamp(f"{target_date} 15:30")
+        nifty_subset = nifty_daily_df[mask].copy()
+        if len(nifty_subset) > 50:
+            market_regime, regime_details = classify_regime_from_data(nifty_subset)
 
     data = {}
     ds = str(target_date)
@@ -186,16 +223,23 @@ def fetch_day(api, token_map, target_date):
     if data:
         cache.parent.mkdir(exist_ok=True)
         with open(cache, "wb") as f:
-            pickle.dump((data, daily_regime), f)
-    return data, daily_regime
+            pickle.dump((data, daily_regime, market_regime, regime_details), f)
+    return data, daily_regime, market_regime, regime_details
 
 
-def simulate_one_day(data, daily_regime=None):
+def simulate_one_day(data, daily_regime=None, market_regime=None, regime_details=None):
     """Run both strategies on one day's data. Returns dict of results."""
     if not data:
         return None
     if daily_regime is None:
         daily_regime = {sym: True for sym in data}
+    if market_regime is None:
+        market_regime = MarketRegime.BULL
+    if regime_details is None:
+        regime_details = {}
+
+    prior_ibs = regime_details.get("prior_day_ibs", 0.5)
+    ibs_size_mult = 0.5 if prior_ibs > 0.25 else 1.0
 
     # Precompute indicators
     for sym, df in data.items():
@@ -254,6 +298,9 @@ def simulate_one_day(data, daily_regime=None):
     trade_count = 0
     s1_signals = 0
     s3_setups = 0
+    daily_pnl_tracker = 0.0
+    daily_losses_consecutive = 0
+    circuit_breaker_active = False
 
     max_candles = max(len(df) for df in data.values())
     sample_sym = list(data.keys())[0]
